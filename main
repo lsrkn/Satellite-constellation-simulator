@@ -1,23 +1,23 @@
 %% ========================================================================
-%  main_AT_sim.m  (ИСПРАВЛЕННАЯ ВЕРСИЯ 4, R2018b+ / проверено под R2021b)
+%  main_AT_sim.m  (ИСПРАВЛЕННАЯ ВЕРСИЯ 5, R2018b+ / проверено под R2021b)
 %  Имитационная модель определения местоположения АТ "Большой" (метод Р3SE)
-%  Сцена: WGS-84, 600 КА ГСО (расписание известно), 250 КА LEO
-%  (Walker 250/10/1, h=550 км, i=74°), 1 АТ (статика / авто 250 км/ч).
 %
-%  ЗАПУСК: сохранить файл как main_AT_sim.m и запустить ЦЕЛИКОМ (Run / F5).
-%  По секциям (Ctrl+Enter) не запускать: локальные функции скрипта
-%  доступны только при запуске всего файла.
+%  ЗАПУСК: сохранить файл (например, main_AT_sim.m) и запустить ЦЕЛИКОМ
+%  (Run / F5). По секциям (Ctrl+Enter) не запускать: локальные функции
+%  скрипта доступны только при запуске всего файла.
 %
-%  ИСПРАВЛЕНИЯ:
-%   FIX-1 geo_all      - несовместимые размеры при конкатенации (z0-скаляр
-%                        против строк 1xN); ГСО теперь действительно
-%                        геостационарна в ECEF.
-%   FIX-2 leo_state    - вращение ECI->ECEF сделано поэлементным (.*) и
-%                        t приводится к строке (иначе mtimes-ошибка/мусор).
+%  Исправления:
+%   FIX-1 geo_all      - ошибка конкатенации размеров; ГСО геостационарна
+%                        в ECEF.
+%   FIX-2 leo_state    - поэлементное вращение ECI->ECEF (.*), t -> строка.
 %   FIX-3 b1_resid     - удалён вызов несуществующей функции E_vN_va.
-%   FIX-4 run_scenario - sim собирается явным присваиванием полей: struct()
-%                        с cell-полем 'log' создавал бы МАССИВ структур.
+%   FIX-4 run_scenario - sim собирается явным присваиванием полей.
 %   FIX-5 защита от пустых данных (prctile_, histogram, yline, text).
+%   FIX-6 channel_analysis - cn0_leo вызывался с 3 аргументами вместо 4
+%                        (не хватало cfg -> "Not enough input arguments");
+%                        заодно убран двойной учёт rain_loss (cn0_leo уже
+%                        вычитает его внутри: Lp=0 -> "дождь",
+%                        +rain_loss -> "ясно").
 %% ========================================================================
 clear; close all; clc; rng(7);
 
@@ -181,8 +181,7 @@ end
 
 % ------------------------- движение КА ----------------------------------
 function [pE,vE,pe,ve]=leo_state(u0,Om0,a,inc,t,cfg)
-% FIX-2: t приводится к строке; вращение ECI->ECEF поэлементное (.*),
-% чтобы функция корректно работала и для векторного t, и для 250 КА.
+% FIX-2: t -> строка; вращение ECI->ECEF поэлементное (.*)
 t=t(:)';
 n=sqrt(cfg.mu/a^3); th=gmst(t,cfg);
 u =u0(:)' + n*t;
@@ -197,9 +196,7 @@ vE=[c.*vrel(1,:)+s.*vrel(2,:); -s.*vrel(1,:)+c.*vrel(2,:); vrel(3,:)];
 end
 
 function pE=geo_all(lamDeg,t,cfg)
-% FIX-1: ГСО неподвижна в ECEF (подспутниковая точка стоит на долготе
-% lam), наклон geoInc даёт лишь малое N-S колебание. Размер строки z
-% согласован с cL (раньше был скаляр -> ошибка конкатенации).
+% FIX-1: ГСО неподвижна в ECEF; размер строки z согласован с cL
 u=cfg.wE*t; si=sind(cfg.geoInc);
 cL=cosd(lamDeg(:))'; sL=sind(lamDeg(:))';
 pE=cfg.aGEO*[cL; sL; si*sin(u)*ones(size(cL))];
@@ -227,6 +224,7 @@ A=g*L;
 end
 function L=point_loss(dA,th3), L=min(12*(dA/th3).^2,25); end
 function cn0=cn0_leo(r,el,Lp,cfg)
+% ВНИМАНИЕ: 4 аргумента (r,el,Lp,cfg). rain_loss(el,cfg) уже учтён внутри!
 cn0=cfg.EIRP_LEO+cfg.GT_AT-fspl(r,cfg.fDL)-atm_loss(el)-rain_loss(el,cfg)...
     -0.2-Lp+228.6;
 end
@@ -339,7 +337,7 @@ end
 
 % ---------------- решатель B1 (один LEO КА) ------------------------------
 function r=b1_resid(x,ep,cfg,mode,useDop)
-% FIX-3: удалён вызов несуществующей функции E_vN_va.
+% FIX-3: без вызова несуществующей функции E_vN_va
 K=numel(ep);
 sr=cfg.c*cfg.sigma_RTT/2; sf=cfg.c*cfg.sigma_f/cfg.fDL;
 tref=ep(1).t; mL=111320;
@@ -583,8 +581,7 @@ for k=1:N
 end
 
 tsn=(passB1.t0+passB1.t1)/2;
-% FIX-4: поля sim присваиваются явно (struct() с cell-полем 'log' создал бы
-% массив структур размером numel(logd) вместо скалярной структуры)
+% FIX-4: явное присваивание полей sim
 sim=struct();
 sim.t=t; sim.st=st; sim.JS=JS; sim.cn0g=cn0g;
 sim.gnE=gnE; sim.brE=brE; sim.fzE=fzE;
@@ -668,7 +665,6 @@ for tries=1:40
       dph=cfg.sigma_eph_pos*[randn;randn;randn];
       dvel=cfg.sigma_eph_vel*[randn;randn;randn];
       [E,Nv,U]=enu_basis(latT,lonT);
-      % векторный расчёт состояний КА на окно 400 с
       ttv=(t0:t0+400)';
       [pEv,~,pev,vev]=leo_state(scene.leo_u0(s),scene.leo_Om0(s),...
           scene.leo_a,scene.leo_i,ttv,cfg);
@@ -691,7 +687,6 @@ for tries=1:40
             cfg.sigma_f*cfg.c/cfg.fDL*randn); %#ok<AGROW>
       end
       if numel(ep)>=120
-        % истина — позиция АТ в средней эпохе
         mid=round(numel(ep)/2); dtm=ep(mid).t-t0;
         lT=latT+vN*dtm/111320; loT=lonT+vE*dtm/(111320*cosd(latT));
         [ph0,lo0]=ecef2geod(pa0+[30e3;0;0],cfg);
@@ -753,8 +748,12 @@ ch.fsplUL=arrayfun(@(x)fspl(x,cfg.fUL),ch.r);
 elv=27.5:1:90;
 rr=arrayfun(@(e) -cfg.Re*sind(e)+sqrt((cfg.Re*sind(e))^2+cfg.aLEO^2-cfg.Re^2),elv);
 ch.el=elv; ch.range=rr;
-ch.cn0clr=arrayfun(@(e,r) cn0_leo(r,e,0,cfg),elv,rr);
-ch.cn0rain=arrayfun(@(e,r) cn0_leo(r,e,rain_loss(e,cfg)),elv,rr);
+% FIX-6: cn0_leo требует 4 аргумента и УЖЕ вычитает rain_loss внутри.
+% Поэтому "дождь 22 мм/ч" = cn0_leo(...,0,cfg), а "ясно" = то же + возврат
+% дождевых потерь (раньше rain_loss передавалась ещё и как Lp -> дождь
+% учитывался дважды, и терялся аргумент cfg).
+ch.cn0clr =arrayfun(@(e,r) cn0_leo(r,e,0,cfg)+rain_loss(e,cfg),elv,rr);
+ch.cn0rain=arrayfun(@(e,r) cn0_leo(r,e,0,cfg),elv,rr);
 ch.snrGrid=-10:0.1:25;
 ch.mcsReq=-5.5+0.55*(0:28);
 op=sim.snr(sim.snr>-90 & ~isnan(sim.snr));
@@ -797,8 +796,7 @@ axes('Position',[0.63 0.55 0.34 0.4]); hold on; grid on;
 scatter(sim.lonA(iSt),sim.latA(iSt),50,'g','filled','DisplayName','истина');
 if ~isempty(sim.coarse)
   scatter(sim.coarse.lonc,sim.coarse.latc,50,'r','filled','DisplayName','ГСО-фикс');
-  % FIX-5: cov задана для (lat,lon) -> переводим к (lon,lat)
-  Cll=[0 1;1 0]*sim.coarse.cov*[0 1;1 0];
+  Cll=[0 1;1 0]*sim.coarse.cov*[0 1;1 0];   % (lat,lon) -> (lon,lat)
   [ex,ey]=cov_ellipse(sim.coarse.lonc,sim.coarse.latc,36*Cll,2);
   plot(ex,ey,'r--','DisplayName','2\sigma эллипс');
 end
@@ -836,7 +834,7 @@ xlabel('время, ч'); ylabel('видимых КА (el\geq27.5°)');
 title(sprintf('Доступность: %.0f%% времени; медиана %.0f КА',100*mean(vis>0),median(vis)));
 subplot(2,1,2); grid on;
 xlabel('max угол места за пролёт,°'); ylabel('пролётов за 24 ч');
-if ~isempty(pr24)                       % FIX-5: защита от пустого набора
+if ~isempty(pr24)
     histogram([pr24.elmax],20);
     title(sprintf('Пролётов: %d, медиана длительности %.0f с',numel(pr24),median([pr24.dur])));
 else
@@ -947,12 +945,12 @@ subplot(1,2,2);
 semilogy(b1.sweepS*1e6,b1.sweepMed,'-o','LineWidth',1.3); grid on;
 xlabel('\sigma_{RTT}, мкс'); ylabel('медианная ошибка B1, м');
 title('Чувствительность к точности RTT');
-yline(150,'m:'); yline(300,'m:');      % FIX-5: два отдельных yline
+yline(150,'m:'); yline(300,'m:');
 end
 
 function p=prctile_(x,q)
 x=sort(x(~isnan(x)));
-if isempty(x), p=NaN; return; end      % FIX-5: защита от пустых данных
+if isempty(x), p=NaN; return; end
 p=x(max(1,min(numel(x),round(q/100*numel(x)))));
 end
 
@@ -1003,7 +1001,8 @@ subplot(1,2,1);
 vals=[median(sim.gnE(sim.gnE<2e3&~isnan(sim.gnE)),'omitnan'), ...
       median(b1.mcS,'omitnan'), median(b1.mcM,'omitnan'), ...
       0.35*median(b1.mcS,'omitnan'), median(mcc.errMed(end,2))];
-bar(vals,'FaceColor','flat'); set(gca,'YScale','log'); grid on;
+bh=bar(vals); bh.FaceColor='flat'; bh.CData=lines(numel(vals));
+set(gca,'YScale','log'); grid on;
 for i=1:4
   if ~isnan(vals(i))
     text(i,vals(i)*1.2,sprintf('%.0f м',vals(i)),'HorizontalAlignment','center');
@@ -1015,7 +1014,7 @@ end
 set(gca,'XTick',1:5,'XTickLabel',{'ГНСС','B1 стат.','B1 движ.','B2 (эмуляция)','луч ГСО'});
 title('Точность по источникам (медианы)');
 subplot(1,2,2);
-tth=b1.ttff(~isnan(b1.ttff))/60;        % FIX-5: защита от пустых данных
+tth=b1.ttff(~isnan(b1.ttff))/60;
 if isempty(tth), tth=0; end
 histogram(tth,30); hold on; grid on;
 xline(15,'r','15 мин (холодный)'); xline(3,'m','3 мин'); xline(0.5,'b','30 с');
