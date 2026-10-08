@@ -1,23 +1,23 @@
 %% ========================================================================
-%  main_AT_sim.m  (ИСПРАВЛЕННАЯ ВЕРСИЯ 5, R2018b+ / проверено под R2021b)
+%  main_AT_sim.m  (ИСПРАВЛЕННАЯ ВЕРСИЯ 6, R2018b+ / проверено под R2021b)
 %  Имитационная модель определения местоположения АТ "Большой" (метод Р3SE)
 %
-%  ЗАПУСК: сохранить файл (например, main_AT_sim.m) и запустить ЦЕЛИКОМ
-%  (Run / F5). По секциям (Ctrl+Enter) не запускать: локальные функции
-%  скрипта доступны только при запуске всего файла.
+%  ЗАПУСК: сохранить файл и запустить ЦЕЛИКОМ (Run / F5). По секциям
+%  (Ctrl+Enter) не запускать: локальные функции скрипта видны только при
+%  запуске всего файла.
 %
 %  Исправления:
-%   FIX-1 geo_all      - ошибка конкатенации размеров; ГСО геостационарна
-%                        в ECEF.
-%   FIX-2 leo_state    - поэлементное вращение ECI->ECEF (.*), t -> строка.
-%   FIX-3 b1_resid     - удалён вызов несуществующей функции E_vN_va.
-%   FIX-4 run_scenario - sim собирается явным присваиванием полей.
-%   FIX-5 защита от пустых данных (prctile_, histogram, yline, text).
-%   FIX-6 channel_analysis - cn0_leo вызывался с 3 аргументами вместо 4
-%                        (не хватало cfg -> "Not enough input arguments");
-%                        заодно убран двойной учёт rain_loss (cn0_leo уже
-%                        вычитает его внутри: Lp=0 -> "дождь",
-%                        +rain_loss -> "ясно").
+%   FIX-1..FIX-6 - geo_all (конкатенация/геостационарность), leo_state
+%                  (поэлементное вращение, t->строка), b1_resid (E_vN_va),
+%                  sim (явные поля), защита от пустых данных, cn0_leo
+%                  (4 аргумента, без двойного дождя).
+%   FIX-7 run_scenario - блок "конец пролёта: B1-фикс" был ВНУТРИ
+%                  "if act(k)>0" при условии act(k)==0 -> никогда не
+%                  выполнялся (b1fix пуст, легенда ругалась, мост не
+%                  обновлялся). Вынесен из блока.
+%   FIX-8 viz_timeline - (sim.t*0+1)*...*sim.t: mtimes двух столбцов N×1
+%                  -> ошибка размерностей. Убран лишний множитель-единицы.
+%   FIX-9 viz_timeline - число подписей легенды = числу кривых.
 %% ========================================================================
 clear; close all; clc; rng(7);
 
@@ -105,8 +105,6 @@ cfg.rain_mmh=22; cfg.I_margin=8;
 cfg.T_end=4200; cfg.dt=1;
 cfg.jam_t0=600; cfg.jam_ramp=60; cfg.jam_JS=40;
 cfg.scan_time=60; cfg.reg_time=8;
-% 10 км: чувствительность доплера к позиции ~0.04 Гц/м;
-% при 3 км сдвиг ~130 Гц < 3*sigma_f — подмена не детектируется.
 cfg.spoof_off=10e3;
 end
 
@@ -224,7 +222,7 @@ A=g*L;
 end
 function L=point_loss(dA,th3), L=min(12*(dA/th3).^2,25); end
 function cn0=cn0_leo(r,el,Lp,cfg)
-% ВНИМАНИЕ: 4 аргумента (r,el,Lp,cfg). rain_loss(el,cfg) уже учтён внутри!
+% 4 аргумента; rain_loss(el,cfg) уже учтён внутри
 cn0=cfg.EIRP_LEO+cfg.GT_AT-fspl(r,cfg.fDL)-atm_loss(el)-rain_loss(el,cfg)...
     -0.2-Lp+228.6;
 end
@@ -337,7 +335,6 @@ end
 
 % ---------------- решатель B1 (один LEO КА) ------------------------------
 function r=b1_resid(x,ep,cfg,mode,useDop)
-% FIX-3: без вызова несуществующей функции E_vN_va
 K=numel(ep);
 sr=cfg.c*cfg.sigma_RTT/2; sf=cfg.c*cfg.sigma_f/cfg.fDL;
 tref=ep(1).t; mL=111320;
@@ -561,19 +558,21 @@ for k=1:N
         end
       end
     end
-    % --- конец пролёта: B1-фикс ---
-    if act(max(k-1,1))>0 && act(k)==0
-      if numel(ep)>=80 && ~isempty(coarse)
-        x0=b1_init(ep,coarse.latc,coarse.lonc,cfg,mode,0,0);
-        [xs,cvx]=b1_solve(ep,x0,cfg,mode,true);
-        bridge_p=geod2ecef(xs(1),xs(2),0,cfg);
-        e1=dist_h(bridge_p,pa,cfg);
-        b1fix(end+1,:)=[tk,e1]; b1pos(end+1,:)=[xs(1),xs(2)]; b1cov=cvx(1:2,1:2);
-        events(end+1,:)=[tk,5]; %#ok<AGROW>
-        logd(end+1)={sprintf('t=%6.0fs  B1-фикс: err=%.0f м (%s) -> мост обновлён',tk,e1,mode)}; %#ok<AGROW>
-      end
-      ep=ep_empty();
+  end
+  % --- конец пролёта: B1-фикс ---
+  % FIX-7: блок вынесен из "if act(k)>0" (внутри него условие act(k)==0
+  % было недостижимо => B1-фиксы никогда не вычислялись, b1fix был пуст)
+  if act(max(k-1,1))>0 && act(k)==0
+    if numel(ep)>=80 && ~isempty(coarse)
+      x0=b1_init(ep,coarse.latc,coarse.lonc,cfg,mode,0,0);
+      [xs,cvx]=b1_solve(ep,x0,cfg,mode,true);
+      bridge_p=geod2ecef(xs(1),xs(2),0,cfg);
+      e1=dist_h(bridge_p,pa,cfg);
+      b1fix(end+1,:)=[tk,e1]; b1pos(end+1,:)=[xs(1),xs(2)]; b1cov=cvx(1:2,1:2);
+      events(end+1,:)=[tk,5]; %#ok<AGROW>
+      logd(end+1)={sprintf('t=%6.0fs  B1-фикс: err=%.0f м (%s) -> мост обновлён',tk,e1,mode)}; %#ok<AGROW>
     end
+    ep=ep_empty();
   end
   % --- ошибки оценок ---
   if all(~isnan(freeze_p)), fzE(k)=dist_h(freeze_p,pa,cfg); end
@@ -709,7 +708,10 @@ pre.t=tt-p.t0; pre.fdT=fdT; pre.fdP=fdP; pre.res=fdT-fdP;
 % TA-невязки: грубый фикс и B1-фикс
 paC=geod2ecef(sim.coarse.latc,sim.coarse.lonc,0,cfg);
 if ~isempty(sim.b1pos)
-  paB=geod2ecef(sim.b1pos(1,1),sim.b1pos(1,2),0,cfg);
+  % берём последний B1-фикс, доступный к началу пролёта B1
+  ii=find(sim.b1fix(:,1)<=p.t0,1,'last');
+  if isempty(ii), ii=1; end
+  paB=geod2ecef(sim.b1pos(ii,1),sim.b1pos(ii,2),0,cfg);
 else
   paB=paC;
 end
@@ -748,10 +750,7 @@ ch.fsplUL=arrayfun(@(x)fspl(x,cfg.fUL),ch.r);
 elv=27.5:1:90;
 rr=arrayfun(@(e) -cfg.Re*sind(e)+sqrt((cfg.Re*sind(e))^2+cfg.aLEO^2-cfg.Re^2),elv);
 ch.el=elv; ch.range=rr;
-% FIX-6: cn0_leo требует 4 аргумента и УЖЕ вычитает rain_loss внутри.
-% Поэтому "дождь 22 мм/ч" = cn0_leo(...,0,cfg), а "ясно" = то же + возврат
-% дождевых потерь (раньше rain_loss передавалась ещё и как Lp -> дождь
-% учитывался дважды, и терялся аргумент cfg).
+% FIX-6: cn0_leo требует 4 аргумента и уже вычитает rain_loss внутри
 ch.cn0clr =arrayfun(@(e,r) cn0_leo(r,e,0,cfg)+rain_loss(e,cfg),elv,rr);
 ch.cn0rain=arrayfun(@(e,r) cn0_leo(r,e,0,cfg),elv,rr);
 ch.snrGrid=-10:0.1:25;
@@ -796,7 +795,7 @@ axes('Position',[0.63 0.55 0.34 0.4]); hold on; grid on;
 scatter(sim.lonA(iSt),sim.latA(iSt),50,'g','filled','DisplayName','истина');
 if ~isempty(sim.coarse)
   scatter(sim.coarse.lonc,sim.coarse.latc,50,'r','filled','DisplayName','ГСО-фикс');
-  Cll=[0 1;1 0]*sim.coarse.cov*[0 1;1 0];   % (lat,lon) -> (lon,lat)
+  Cll=[0 1;1 0]*sim.coarse.cov*[0 1;1 0];
   [ex,ey]=cov_ellipse(sim.coarse.lonc,sim.coarse.latc,36*Cll,2);
   plot(ex,ey,'r--','DisplayName','2\sigma эллипс');
 end
@@ -968,9 +967,15 @@ end
 title('Автомат состояний P0..P7 (джамминг -> RF_HOLD -> B1 -> спуфинг)');
 subplot(4,1,2);
 semilogy(sim.t/60,sim.gnE,'g',sim.t/60,sim.fzE,'k',sim.t/60,sim.brE,'b'); grid on;
-hold on; plot(sim.b1fix(:,1)/60,sim.b1fix(:,2),'mo','MarkerFaceColor','m');
+hold on;
+% FIX-9: подписи легенды добавляем только под реально построенные кривые
+lgd={'ГНСС','мост «заморожен»','мост RF (B1)'};
+if ~isempty(sim.b1fix)
+    plot(sim.b1fix(:,1)/60,sim.b1fix(:,2),'mo','MarkerFaceColor','m');
+    lgd{end+1}='B1-фиксы';
+end
 xlabel('t, мин'); ylabel('ошибка, м');
-legend('ГНСС','мост «заморожен»','мост RF (B1)','B1-фиксы');
+legend(lgd);
 title('Ошибки позиции: рост «моста» линеен (~v·\Deltat), RF-мост ограничивает B1-точностью');
 subplot(4,1,3);
 plot(sim.t/60,sim.JS,'r',sim.t/60,sim.cn0g,'b'); grid on;
@@ -989,7 +994,8 @@ if ~isnan(sim.spoofDet), xline(sim.spoofDet/60,'m','спуфинг детект.
 xlabel('t, мин'); ylabel('\Delta f невязка ГНСС<->RF, Гц');
 title('Кросс-сверка доплера: детекция подмены PVT (Фаза IV)');
 subplot(2,1,2);
-plot(sim.t/60,(sim.t*0+1)*cfg.opp_ppm*1e-6*cfg.fDL/1e3*sim.t/max(sim.t),'k'); grid on;
+% FIX-8: убран множитель (sim.t*0+1) — было mtimes двух столбцов N×1
+plot(sim.t/60, cfg.opp_ppm*1e-6*cfg.fDL/1e3*sim.t/max(sim.t), 'k'); grid on;
 xlabel('t, мин'); ylabel('уход опоры, кГц');
 title(sprintf('Holdover: дрейф опоры \\leq%.0f ppm \\rightarrow \\leq%.1f кГц @ %.0f ГГц (внутри ±270 кГц)',...
     cfg.opp_ppm,cfg.opp_ppm*1e-6*cfg.fDL/1e3,cfg.fDL/1e9));
