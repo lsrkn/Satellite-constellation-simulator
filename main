@@ -1,0 +1,1030 @@
+%% ========================================================================
+%  main_AT_sim.m  (ИСПРАВЛЕННАЯ ВЕРСИЯ 4, R2018b+ / проверено под R2021b)
+%  Имитационная модель определения местоположения АТ "Большой" (метод Р3SE)
+%  Сцена: WGS-84, 600 КА ГСО (расписание известно), 250 КА LEO
+%  (Walker 250/10/1, h=550 км, i=74°), 1 АТ (статика / авто 250 км/ч).
+%
+%  ЗАПУСК: сохранить файл как main_AT_sim.m и запустить ЦЕЛИКОМ (Run / F5).
+%  По секциям (Ctrl+Enter) не запускать: локальные функции скрипта
+%  доступны только при запуске всего файла.
+%
+%  ИСПРАВЛЕНИЯ:
+%   FIX-1 geo_all      - несовместимые размеры при конкатенации (z0-скаляр
+%                        против строк 1xN); ГСО теперь действительно
+%                        геостационарна в ECEF.
+%   FIX-2 leo_state    - вращение ECI->ECEF сделано поэлементным (.*) и
+%                        t приводится к строке (иначе mtimes-ошибка/мусор).
+%   FIX-3 b1_resid     - удалён вызов несуществующей функции E_vN_va.
+%   FIX-4 run_scenario - sim собирается явным присваиванием полей: struct()
+%                        с cell-полем 'log' создавал бы МАССИВ структур.
+%   FIX-5 защита от пустых данных (prctile_, histogram, yline, text).
+%% ========================================================================
+clear; close all; clc; rng(7);
+
+%% ---------------- 1. КОНФИГУРАЦИЯ --------------------------------------
+cfg = cfg_default();
+
+%% ---------------- 2. СЦЕНА ---------------------------------------------
+scene = build_scene(cfg);
+fprintf('Сцена: %d ГСО, %d LEO, АТ: %s (%.2fN %.2fE)\n', ...
+    cfg.N_GEO, cfg.N_LEO, cfg.mob, cfg.atLat, cfg.atLon);
+
+%% ---------------- 3. ДОСТУПНОСТЬ LEO / ПРОЛЁТЫ (S1) --------------------
+[vis, tt24, pr24] = leo_availability(cfg, scene, 24*3600, 20, 120);
+fprintf('Доступность LEO за 24ч: %.1f%%, пролётов: %d, медиана max el: %.1f°\n',...
+    100*mean(vis>0), numel(pr24), median([pr24.elmax]));
+
+%% ---------------- 4. ОСНОВНОЙ СЦЕНАРИЙ S2-S4 ---------------------------
+sim = run_scenario(cfg, scene);
+print_sorm(sim.log);
+
+%% ---------------- 5. ГСО-ПЕЛЕНГ: калибровка + Монте-Карло --------------
+cal = gso_calibration(cfg, scene);
+mcc = coarse_mc(cfg, scene);
+
+%% ---------------- 6. ПРЕДКОМПЕНСАЦИЯ tau/dF ----------------------------
+pre = predcomp_analysis(cfg, scene, sim);
+
+%% ---------------- 7. КАНАЛ ---------------------------------------------
+ch = channel_analysis(cfg, sim);
+
+%% ---------------- 8. B1: сходимость, Монте-Карло, TTFF -----------------
+b1 = b1_analysis(cfg, scene, sim, pr24);
+
+%% ---------------- 9. ГРАФИКИ -------------------------------------------
+viz_scene(cfg, scene, sim);          % Рис.1
+viz_tracks(cfg, scene);              % Рис.2
+viz_availability(vis, tt24, pr24);   % Рис.3
+viz_gso(cal, mcc, sim);              % Рис.4-5
+viz_predcomp(pre, sim, cfg);         % Рис.6-8
+viz_channel(ch, sim, cfg);           % Рис.9-10
+viz_b1(b1, cfg);                     % Рис.11,14
+viz_timeline(sim, cfg);              % Рис.12-13
+viz_summary(sim, b1, mcc);           % Рис.15
+fprintf('Готово: построено 15 рисунков.\n');
+
+%% ========================================================================
+%%                         ЛОКАЛЬНЫЕ ФУНКЦИИ
+%% ========================================================================
+function cfg = cfg_default()
+cfg.c=299792458; cfg.kB=1.380649e-23;
+cfg.mu=3.986004418e14; cfg.Re=6378.137e3; cfg.fE=1/298.257223563;
+cfg.J2=1.08262668e-3;  cfg.wE=7.2921158553e-5;
+cfg.t0=datetime(2026,1,1,0,0,0);
+% ---- ГСО ----
+cfg.N_GEO=600; cfg.geoSlot=0.6; cfg.geoInc=0.05;
+cfg.aGEO=(cfg.mu/cfg.wE^2)^(1/3);
+cfg.EIRP_GSO=40; cfg.fGSO=11.7e9;
+cfg.sigma_ang=0.15;
+cfg.elMinGEO=10;
+% ---- LEO: Walker 250/10/1 ----
+cfg.N_LEO=250; cfg.LEO_P=10; cfg.LEO_S=25; cfg.LEO_F=1;
+cfg.hLEO=550e3; cfg.aLEO=cfg.Re+cfg.hLEO; cfg.iLEO=74;
+cfg.EIRP_LEO=36; cfg.fDL=11.7e9; cfg.fUL=14.2e9; cfg.BW=400e6;
+cfg.GT_AT=12; cfg.Dant=0.6;
+cfg.lam=cfg.c/cfg.fDL;
+cfg.theta3=70*cfg.lam/cfg.Dant;
+cfg.Gmax=20*log10(pi*cfg.Dant/cfg.lam)+10*log10(0.55);
+cfg.elMin=27.5;
+cfg.sigma_eph_pos=50; cfg.sigma_eph_vel=0.05;
+% ---- измерения АТ ----
+cfg.sigma_RTT=0.3e-6;
+cfg.TA_q=30e-9;
+cfg.sigma_f=80;
+cfg.opp_ppm=1.0;
+cfg.sigma_gnss=2.5;
+% ---- бюджеты ТТ ----
+cfg.dFmax=270e3; cfg.taumax=295e-9; cfg.pointMax=0.25;
+% ---- АТ ----
+cfg.atLat=55.75; cfg.atLon=37.62;
+cfg.mob='auto';
+cfg.vAuto=250/3.6; cfg.turnP=600; cfg.turnA=40;
+% ---- канал ----
+cfg.rain_mmh=22; cfg.I_margin=8;
+% ---- сценарий ----
+cfg.T_end=4200; cfg.dt=1;
+cfg.jam_t0=600; cfg.jam_ramp=60; cfg.jam_JS=40;
+cfg.scan_time=60; cfg.reg_time=8;
+% 10 км: чувствительность доплера к позиции ~0.04 Гц/м;
+% при 3 км сдвиг ~130 Гц < 3*sigma_f — подмена не детектируется.
+cfg.spoof_off=10e3;
+end
+
+function scene = build_scene(cfg)
+scene.geo_lam = -180 + cfg.geoSlot*(0:cfg.N_GEO-1);
+k=0; scene.leo_u0=zeros(cfg.N_LEO,1); scene.leo_Om0=zeros(cfg.N_LEO,1);
+for p=0:cfg.LEO_P-1
+  for j=0:cfg.LEO_S-1
+    k=k+1; scene.leo_Om0(k)=p*360/cfg.LEO_P;
+    scene.leo_u0(k)=mod(2*pi*j/cfg.LEO_S+2*pi*cfg.LEO_F*p*cfg.LEO_S/cfg.N_LEO,2*pi);
+  end
+end
+scene.leo_a=cfg.aLEO; scene.leo_i=cfg.iLEO;
+if strcmp(cfg.mob,'static'), scene.at=@(t) static_track(t,cfg);
+else,                        scene.at=@(t) auto_track(t,cfg); end
+end
+
+function [lat,lon,vE,vN]=static_track(t,cfg)
+lat=cfg.atLat*ones(size(t)); lon=cfg.atLon*ones(size(t));
+vE=zeros(size(t)); vN=zeros(size(t));
+end
+
+function [lat,lon,vE,vN]=auto_track(t,cfg)
+v=cfg.vAuto; psi=45+cfg.turnA*sin(2*pi*t/cfg.turnP);
+vE=v*sind(psi); vN=v*cosd(psi);
+lat=zeros(size(t)); lon=zeros(size(t)); lat(1)=cfg.atLat; lon(1)=cfg.atLon;
+mL=111320;
+for k=2:numel(t)
+  dt=t(k)-t(k-1);
+  lon(k)=lon(k-1)+vE(k-1)*dt/(mL*cosd(lat(k-1)));
+  lat(k)=lat(k-1)+vN(k-1)*dt/mL;
+end
+end
+
+% ------------------------- координаты -----------------------------------
+function p=geod2ecef(lat,lon,h,cfg)
+la=lat*pi/180; lo=lon*pi/180; e2=cfg.fE*(2-cfg.fE);
+N=cfg.Re./sqrt(1-e2*sin(la).^2);
+p=[(N+h).*cos(la).*cos(lo); (N+h).*cos(la).*sin(lo); (N*(1-e2)+h).*sin(la)];
+end
+
+function [lat,lon,h]=ecef2geod(p,cfg)
+a=cfg.Re; e2=cfg.fE*(2-cfg.fE); ep2=e2/(1-e2);
+x=p(1,:); y=p(2,:); z=p(3,:); p2=x.^2+y.^2;
+lon=mod(atan2d(y,x)+180,360)-180;
+th=atan2(z*a,p2.*sqrt(ep2));
+lat=atan2d(z+ep2*a*sin(th).^3, sqrt(p2)-e2*a*cos(th).^3);
+N=a./sqrt(1-e2*sind(lat).^2);
+h=sqrt(p2)./cosd(lat)-N;
+end
+
+function [E,N,U]=enu_basis(lat,lon)
+la=lat*pi/180; lo=lon*pi/180;
+E=[-sin(lo);cos(lo);0];
+N=[-sin(la)*cos(lo);-sin(la)*sin(lo);cos(la)];
+U=[cos(la)*cos(lo);cos(la)*sin(lo);sin(la)];
+end
+
+function th=gmst(t,cfg)
+jd=datenum(cfg.t0)+t/86400+1721058.5;
+th=mod(280.46061837+360.98564736629*(jd-2451545.0),360)*pi/180;
+end
+
+function pe=ecef2eci(pecef,t,cfg)
+th=gmst(t,cfg); c=cos(th); s=sin(th);
+pe=[c*pecef(1)-s*pecef(2); s*pecef(1)+c*pecef(2); pecef(3)];
+end
+
+function d=dist_h(p1,p2,cfg)   % горизонтальное расстояние, м
+d=2*asind(min(1,norm(p1-p2)/(2*cfg.Re)))*pi/180*cfg.Re;
+end
+
+% ------------------------- движение КА ----------------------------------
+function [pE,vE,pe,ve]=leo_state(u0,Om0,a,inc,t,cfg)
+% FIX-2: t приводится к строке; вращение ECI->ECEF поэлементное (.*),
+% чтобы функция корректно работала и для векторного t, и для 250 КА.
+t=t(:)';
+n=sqrt(cfg.mu/a^3); th=gmst(t,cfg);
+u =u0(:)' + n*t;
+Om=Om0(:)' - 1.5*n*cfg.J2*(cfg.Re/a)^2*cosd(inc)*t;
+cu=cos(u); su=sin(u); ci=cosd(inc); si=sind(inc); cO=cos(Om); sO=sin(Om);
+pe=a*[cO.*cu-sO.*ci.*su; sO.*cu+cO.*ci.*su; si.*su];
+ve=a*n*[-sO.*su-cO.*ci.*cu; cO.*su-sO.*ci.*cu; si.*cu];
+c=cos(th); s=sin(th);
+pE=[c.*pe(1,:)+s.*pe(2,:); -s.*pe(1,:)+c.*pe(2,:); pe(3,:)];
+vrel=ve-[-cfg.wE*pe(2,:); cfg.wE*pe(1,:); zeros(1,size(pe,2))];
+vE=[c.*vrel(1,:)+s.*vrel(2,:); -s.*vrel(1,:)+c.*vrel(2,:); vrel(3,:)];
+end
+
+function pE=geo_all(lamDeg,t,cfg)
+% FIX-1: ГСО неподвижна в ECEF (подспутниковая точка стоит на долготе
+% lam), наклон geoInc даёт лишь малое N-S колебание. Размер строки z
+% согласован с cL (раньше был скаляр -> ошибка конкатенации).
+u=cfg.wE*t; si=sind(cfg.geoInc);
+cL=cosd(lamDeg(:))'; sL=sind(lamDeg(:))';
+pE=cfg.aGEO*[cL; sL; si*sin(u)*ones(size(cL))];
+end
+
+% ------------------------- геометрия ------------------------------------
+function [el,az,r]=geom_multi(Psat,p_at,lat,lon)
+D=Psat-p_at; r=vecnorm(D); u=D./r;
+[E,N,U]=enu_basis(lat,lon);
+el=asind(min(1,max(-1,u.'*U)));
+az=mod(atan2d(u.'*E,u.'*N),360);
+end
+
+function rr=los_rate(ps_eci,vs_eci,pa_eci,va_eci)
+d=ps_eci-pa_eci; u=d/vecnorm(d);
+rr=dot(u,vs_eci-va_eci);
+end
+
+% ------------------------- канал ----------------------------------------
+function L=fspl(r,f), L=32.45+20*log10(r/1e3)+20*log10(f/1e6); end
+function A=atm_loss(el), A=0.07/max(sind(max(el,5)),0.1); end
+function A=rain_loss(el,cfg)
+g=0.0207*cfg.rain_mmh^1.16; L=min(10,4/(max(sind(max(el,5)),0.1)+0.02));
+A=g*L;
+end
+function L=point_loss(dA,th3), L=min(12*(dA/th3).^2,25); end
+function cn0=cn0_leo(r,el,Lp,cfg)
+cn0=cfg.EIRP_LEO+cfg.GT_AT-fspl(r,cfg.fDL)-atm_loss(el)-rain_loss(el,cfg)...
+    -0.2-Lp+228.6;
+end
+
+% ------------- пустая структура эпохи ------------------------------------
+function s=ep_empty()
+s=struct('t',{},'ps_ecef',{},'ps_eci',{},'vs_eci',{},'rho',{},'rr',{});
+end
+
+% ---------------- ГСО-пеленгация (грубая позиция) -----------------------
+function r=gso_resid(x,azm,elm,lamS,cfg)
+n=numel(lamS); r=zeros(2*n,1);
+for i=1:n
+  ps=geo_all(lamS(i),0,cfg); pa=geod2ecef(x(1),x(2),0,cfg);
+  [el,az]=geom_multi(ps,pa,x(1),x(2));
+  daz=wrapdeg(az-azm(i));
+  r(i)  =daz/(cfg.sigma_ang/max(cosd(el),0.3));
+  r(n+i)=(el-elm(i))/cfg.sigma_ang;
+end
+end
+
+function [phi,lon,covc]=gso_fix(azm,elm,lamS,x0,cfg)
+x=x0(:);
+for it=1:30
+  r=gso_resid(x,azm,elm,lamS,cfg);
+  J=numjac(@(xx)gso_resid(xx,azm,elm,lamS,cfg),x);
+  dx=-(J'*J+1e-6*eye(2))\(J'*r); x=x+dx;
+  if norm(dx)<1e-7, break; end
+end
+phi=mod(x(1)+90,180)-90; lon=mod(x(2)+180,360)-180;
+covc=inv(J'*J+1e-6*eye(2));
+end
+
+function [azm,elm,lamSel,elTrue]=coarse_meas(cfg,scene,t,lat,lon)
+pa=geod2ecef(lat,lon,0,cfg);
+pg=geo_all(scene.geo_lam,t,cfg);
+[el,az]=geom_multi(pg,pa,lat,lon);
+ii=find(el>=cfg.elMinGEO); [~,o]=sort(el(ii),'descend');
+sel=ii(o(1:min(6,numel(ii)))); sel=sel(:);
+azm=az(sel); azm=azm(:);
+elm=el(sel); elm=elm(:);
+lamSel=scene.geo_lam(sel); lamSel=lamSel(:);
+elTrue=el(sel); elTrue=elTrue(:);
+azm=azm+(cfg.sigma_ang./max(cosd(elm),0.3)).*randn(numel(sel),1);
+elm=elm+cfg.sigma_ang*randn(numel(sel),1);
+end
+
+function cal=gso_calibration(cfg,scene)
+phi=0:1:80; el=atan2d(cosd(phi)-cfg.Re/cfg.aGEO,sind(phi));
+cal.phi=phi; cal.el=el;
+[azm,~,~,elT]=coarse_meas(cfg,scene,0,cfg.atLat,cfg.atLon);
+cal.measEl=elT; cal.measAz=azm;
+end
+
+function mcc=coarse_mc(cfg,scene)
+sigL=0.05:0.05:0.5; nL=[2 3 4 6]; R=25;
+mcc.errMed=zeros(numel(sigL),numel(nL)); mcc.sigL=sigL; mcc.nL=nL;
+mcc.example=[];
+for a=1:numel(nL)
+  for b=1:numel(sigL)
+    e=zeros(R,1);
+    for r=1:R
+      rng(100+a*20+b*300+r);
+      cfg2=cfg; cfg2.sigma_ang=sigL(b);
+      lat=45+25*rand; lon=30+90*rand;
+      [azm,elm,ls]=coarse_meas(cfg2,scene,rand*800,lat,lon);
+      [~,o]=sort(elm,'descend'); m=min(nL(a),numel(o));
+      [ph,lo]=gso_fix(azm(o(1:m)),elm(o(1:m)),ls(o(1:m)),[50;mean(ls)],cfg2);
+      e(r)=dist_h(geod2ecef(lat,lon,0,cfg),geod2ecef(ph,lo,0,cfg),cfg);
+      if a==2&&b==6&&r==1
+        mcc.example=struct('latT',lat,'lonT',lon,'latE',ph,'lonE',lo,'cov',eye(2));
+      end
+    end
+    mcc.errMed(b,a)=median(e);
+  end
+end
+end
+
+% ---------------- доступность LEO и пролёты -----------------------------
+function [vis,tt,pr]=leo_availability(cfg,scene,T,dt,minDur)
+tt=(0:dt:T)'; vis=zeros(size(tt));
+pa=geod2ecef(cfg.atLat,cfg.atLon,0,cfg);
+for k=1:numel(tt)
+  [pE,~]=leo_state(scene.leo_u0,scene.leo_Om0,scene.leo_a,scene.leo_i,tt(k),cfg);
+  el=geom_multi(pE,pa,cfg.atLat,cfg.atLon);
+  vis(k)=sum(el>=cfg.elMin);
+end
+on=vis>0; d=diff([false;on;false]);
+i1=find(d==1); i2=find(d==-1)-1;
+pr=struct('t0',{},'t1',{},'dur',{},'sat',{},'elmax',{});
+for m=1:numel(i1)
+  tm=(tt(i1(m))+tt(i2(m)))/2;
+  [pE,~]=leo_state(scene.leo_u0,scene.leo_Om0,scene.leo_a,scene.leo_i,tm,cfg);
+  [el,~]=geom_multi(pE,pa,cfg.atLat,cfg.atLon);
+  [em,ix]=max(el);
+  pr(end+1)=struct('t0',tt(i1(m)),'t1',tt(i2(m)),'dur',tt(i2(m))-tt(i1(m)),...
+      'sat',ix,'elmax',em); %#ok<AGROW>
+end
+keep=[pr.dur]>=minDur; pr=pr(keep);
+end
+
+function pr=get_passes(cfg,scene,H,dt,minDur)
+pr=[]; H0=H;
+while isempty(pr) && H<6*3600
+  [~,~,pr]=leo_availability(cfg,scene,H,dt,minDur);
+  if isempty(pr), H=H+1800; end
+end
+if isempty(pr), error('Пролёты LEO не найдены за %g ч', H0/3600); end
+end
+
+% ---------------- решатель B1 (один LEO КА) ------------------------------
+function r=b1_resid(x,ep,cfg,mode,useDop)
+% FIX-3: удалён вызов несуществующей функции E_vN_va.
+K=numel(ep);
+sr=cfg.c*cfg.sigma_RTT/2; sf=cfg.c*cfg.sigma_f/cfg.fDL;
+tref=ep(1).t; mL=111320;
+if strcmp(mode,'static')
+  phi=x(1); lon=x(2); b=x(3); bd=x(4); vE=0; vN=0;
+else
+  phi=x(1); lon=x(2); vE=x(3); vN=x(4); b=x(5); bd=x(6);
+end
+r=zeros(K+K*double(useDop),1);
+for k=1:K
+  dt=ep(k).t-tref;
+  ph=phi+vN*dt/mL; lo=lon+vE*dt/(mL*cosd(phi));
+  pa=geod2ecef(ph,lo,0,cfg);
+  pa_eci=ecef2eci(pa,ep(k).t,cfg);
+  [E,Nc]=enu_basis(ph,lo);
+  va_eci=ecef2eci(E*vE+Nc*vN,ep(k).t,cfg)+cross([0;0;cfg.wE],pa_eci);
+  d=ep(k).ps_ecef-pa; rr_=norm(d);
+  de=ep(k).ps_eci-pa_eci; u=de/norm(de);
+  r(k)=(rr_+b-ep(k).rho)/sr;
+  if useDop
+    r(K+k)=(dot(u,ep(k).vs_eci-va_eci)+bd-ep(k).rr)/sf;
+  end
+end
+end
+
+function J=numjac(fun,x)
+n=numel(x); r0=fun(x); J=zeros(numel(r0),n);
+for p=1:n
+  h=max(1e-6*abs(x(p)),1e-8);
+  xp=x; xm=x; xp(p)=x(p)+h; xm(p)=x(p)-h;
+  J(:,p)=(fun(xp)-fun(xm))/(2*h);
+end
+end
+
+function [x,covx]=b1_solve(ep,x0,cfg,mode,useDop)
+x=x0(:); lam=1e-3;
+f=@(xx)b1_resid(xx,ep,cfg,mode,useDop);
+r=f(x); c=r'*r;
+for it=1:50
+  J=numjac(f,x); H=J'*J; g=J'*r;
+  dx=-(H+lam*eye(numel(x)))\g;
+  xn=x+dx; rn=f(xn); cn=rn'*rn;
+  if cn<c
+    if c-cn<1e-12*max(c,1), x=xn; break; end
+    x=xn; r=rn; c=cn; lam=max(lam/3,1e-9);
+  else
+    lam=lam*5; if lam>1e12, break; end
+  end
+end
+J=numjac(f,x); covx=inv(J'*J+1e-9*eye(numel(x)));
+end
+
+function x0=b1_init(ep,phi0,lon0,cfg,mode,vE0,vN0) %#ok<INUSD>
+pa=geod2ecef(phi0,lon0,0,cfg);
+rh=zeros(numel(ep),1); rv=zeros(numel(ep),1);
+for k=1:numel(ep)
+  rh(k)=norm(ep(k).ps_ecef-pa);
+  pa_eci=ecef2eci(pa,ep(k).t,cfg);
+  u=(ep(k).ps_eci-pa_eci)/norm(ep(k).ps_eci-pa_eci);
+  rv(k)=dot(u,ep(k).vs_eci);
+end
+b0=mean([ep.rho])-mean(rh); bd0=mean([ep.rr])-mean(rv);
+if strcmp(mode,'static'), x0=[phi0;lon0;b0;bd0];
+else, x0=[phi0;lon0;vE0;vN0;b0;bd0];
+end
+end
+
+% ---------------- основной сценарий --------------------------------------
+function sim=run_scenario(cfg,scene)
+% --- расписание событий ---
+pr=get_passes(cfg,scene,cfg.T_end,10,120);
+H=cfg.T_end;
+c1=pr([pr.t0]>=cfg.jam_t0+cfg.jam_ramp & [pr.dur]>=120);
+while isempty(c1), H=H+1800; pr=get_passes(cfg,scene,H,10,120);
+  c1=pr([pr.t0]>=cfg.jam_t0+cfg.jam_ramp & [pr.dur]>=120); end
+passB1=c1(1);
+c2=pr([pr.t0]>=passB1.t1+600 & [pr.dur]>=170);
+if isempty(c2), c2=pr([pr.t0]>=passB1.t1+300 & [pr.dur]>=150); end
+if isempty(c2), c2=pr([pr.t0]>passB1.t0 & [pr.dur]>=120); end
+if isempty(c2), passSp=pr(end); else, passSp=c2(1); end
+t_gnss_on=passSp.t0-30;
+t_spoof0=passSp.t0+40;
+spoof_ramp=60; spoof_dur=max(0,min(120,passSp.t1-t_spoof0-60));
+t_spoof1=t_spoof0+spoof_ramp+spoof_dur;
+T=max([cfg.T_end, t_spoof1+150, passSp.t1+150, passB1.t1+10]);
+t=(0:cfg.dt:T)'; N=numel(t);
+[latA,lonA,vEa,vNa]=scene.at(t);
+
+prIn=pr([pr.t1]<=T & [pr.dur]>=120);
+act=zeros(N,1);
+for m=1:numel(prIn), act(t>=prIn(m).t0 & t<=prIn(m).t1)=m; end
+pbIdx=find([prIn.t0]==passB1.t0); if ~isempty(pbIdx), pbIdx=pbIdx(1); end
+psIdx=find([prIn.t0]==passSp.t0); if ~isempty(psIdx), psIdx=psIdx(1); end
+
+mode='static'; if strcmp(cfg.mob,'auto'), mode='move'; end
+slope=(2*rand-1)*cfg.opp_ppm*1e-6*cfg.fDL/3600;   % дрейф опоры, Гц/с
+
+st=zeros(N,1); st(:)=-1;
+JS=zeros(N,1); cn0g=NaN(N,1);
+gnE=NaN(N,1); brE=NaN(N,1); fzE=NaN(N,1);
+elv=NaN(N,1); cn0dl=NaN(N,1); snr=NaN(N,1);
+fdT=NaN(N,1); fdP=NaN(N,1); fdM=NaN(N,1); Df=NaN(N,1); rttM=NaN(N,1);
+logd={}; events=zeros(0,2);
+bridge_p=NaN(3,1); freeze_p=NaN(3,1);
+coarse=[]; ep=ep_empty(); epB1=ep_empty();
+b1fix=zeros(0,2); b1pos=[]; b1cov=eye(2);
+jamDet=NaN; fixLost=NaN; spoofDet=NaN; nbad=0; ngood=0; lastGnss=NaN(3,1);
+Df0=NaN;
+
+for k=1:N
+  tk=t(k);
+  pa=geod2ecef(latA(k),lonA(k),0,cfg);
+  [E,Nt]=enu_basis(latA(k),lonA(k));
+  va=E*vEa(k)+Nt*vNa(k);
+  % --- помеха ---
+  if tk>=cfg.jam_t0 && tk<t_gnss_on
+    js=min(cfg.jam_JS,(tk-cfg.jam_t0)/cfg.jam_ramp*cfg.jam_JS);
+  else
+    js=0;
+  end
+  JS(k)=js; cn0g(k)=max(45-js,3);
+  gnss_ok = js<30;
+  spo=0;
+  if tk>=t_spoof0 && tk<=t_spoof1
+    spo=cfg.spoof_off*min(1,(tk-t_spoof0)/spoof_ramp);
+  end
+  % --- ГНСС-оценка ---
+  gpos=pa+spo*(cosd(35)*E+sind(35)*Nt);
+  if gnss_ok
+    gnE(k)=dist_h(gpos,pa,cfg)+hypot(cfg.sigma_gnss*randn,cfg.sigma_gnss*randn);
+  end
+  % --- автомат состояний ---
+  if tk<30, st(k)=0;
+  elseif tk<cfg.scan_time+30
+    st(k)=1;
+    if tk>=cfg.scan_time+30-1 && isempty(coarse)
+      [azm,elm,ls]=coarse_meas(cfg,scene,tk,latA(k),lonA(k));
+      [ph,lo,covc]=gso_fix(azm,elm,ls,[50;mean(ls)],cfg);
+      coarse=struct('latc',ph,'lonc',lo,'cov',covc,'t',tk,...
+          'err',dist_h(geod2ecef(ph,lo,0,cfg),pa,cfg));
+      events(end+1,:)=[tk,3]; %#ok<AGROW>
+      logd(end+1)={sprintf('t=%6.0fs  P1->грубо: (%.4f, %.4f), err=%.1f км (ГСО-пеленг)',...
+          tk,ph,lo,coarse.err/1e3)}; %#ok<AGROW>
+    end
+  else
+    st(k)=st(max(k-1,1));
+  end
+  if st(k)==1 && ~isempty(coarse)
+    st(k)=4; lastGnss=gpos;
+  end
+  if st(k)==4
+    lastGnss=gpos;
+    if isnan(jamDet) && js>=15
+      jamDet=tk; events(end+1,:)=[tk,1]; %#ok<AGROW>
+      logd(end+1)={sprintf('t=%6.0fs  ДЖАММИНГ детектирован (C/N0 down >3 дБ/5с, J/S>=15 дБ)',tk)}; %#ok<AGROW>
+    end
+    if js>=30 && isnan(fixLost)
+      fixLost=tk; st(k)=5; freeze_p=lastGnss; bridge_p=lastGnss;
+      events(end+1,:)=[tk,2]; %#ok<AGROW>
+      logd(end+1)={sprintf('t=%6.0fs  Фикс потерян (J/S>=30 дБ) -> P5 RF_HOLD',tk)}; %#ok<AGROW>
+    end
+  end
+  % --- RF-измерения при активном пролёте ---
+  if act(k)>0
+    m=act(k); s=prIn(m).sat;
+    [pE,vE,pe,ve]=leo_state(scene.leo_u0(s),scene.leo_Om0(s),scene.leo_a,scene.leo_i,tk,cfg);
+    [el,~,rg]=geom_multi(pE,pa,latA(k),lonA(k));
+    pa_eci=ecef2eci(pa,tk,cfg);
+    va_eci=ecef2eci(va,tk,cfg)+cross([0;0;cfg.wE],pa_eci);
+    fd=-cfg.fDL/cfg.c*los_rate(pe,ve,pa_eci,va_eci);
+    rtt=2*rg/cfg.c+cfg.sigma_RTT*randn+(rand-0.5)*2*cfg.TA_q;
+    elv(k)=el; rttM(k)=rtt*1e3;
+    fdT(k)=fd; fdM(k)=fd+slope*tk+cfg.sigma_f*randn;
+    Lp=point_loss(dist_h(bridge_p,pa,cfg)/rg*180/pi,cfg.theta3);
+    if any(isnan(bridge_p)), Lp=0; end
+    cn0dl(k)=cn0_leo(rg,el,Lp,cfg);
+    snr(k)=cn0dl(k)-10*log10(cfg.BW)-cfg.I_margin;
+    if ~isempty(coarse)   % прогноз доплера по грубой позиции
+      paC=geod2ecef(coarse.latc,coarse.lonc,0,cfg);
+      paC_eci=ecef2eci(paC,tk,cfg);
+      fdP(k)=-cfg.fDL/cfg.c*los_rate(pe,ve,paC_eci,cross([0;0;cfg.wE],paC_eci));
+    end
+    % --- захват DL в начале пролёта ---
+    if act(max(k-1,1))==0 && st(k)>=4
+      events(end+1,:)=[tk,4]; %#ok<AGROW>
+      logd(end+1)={sprintf('t=%6.0fs  DL захвачен (SSB, предкомп. dF по ГСО-фиксу) -> P3 RF_TRACK',tk)}; %#ok<AGROW>
+    end
+    % --- накопление эпох B1 ---
+    dph=cfg.sigma_eph_pos*[randn;randn;randn];
+    dvel=cfg.sigma_eph_vel*[randn;randn;randn];
+    ep(end+1)=struct('t',tk,'ps_ecef',pE+dph,'ps_eci',pe+dph,...
+        'vs_eci',ve+dvel,'rho',cfg.c*rtt/2,'rr',-fdM(k)*cfg.c/cfg.fDL); %#ok<AGROW>
+    if ~isempty(pbIdx) && m==pbIdx, epB1(end+1)=ep(end); end %#ok<AGROW>
+    % --- кросс-сверка ГНСС<->RF (доплер) ---
+    fd_pred_g=-cfg.fDL/cfg.c*los_rate(pe,ve,ecef2eci(gpos,tk,cfg),...
+        ecef2eci(va,tk,cfg)+cross([0;0;cfg.wE],pa_eci));
+    Df(k)=fdM(k)-fd_pred_g;
+    % --- база невязки до подмены / слежение после подмены ---
+    if ~isempty(psIdx) && act(k)==psIdx
+      if tk>=t_spoof0-20 && tk<t_spoof0-5
+        Df0=median(Df(max(1,k-15):k),'omitnan');
+      elseif tk>t_spoof1 && st(k)==5
+        Df0=median(Df(max(1,k-15):k),'omitnan');   % компенсация дрейфа опоры
+      end
+    end
+    % --- СПОУФИНГ-контроль ---
+    if ~isempty(psIdx) && act(k)==psIdx && st(k)>=4 && ~isnan(Df0) && ~isnan(Df(k))
+      if isnan(spoofDet) && tk>=t_spoof0 && tk<=t_spoof1
+        if abs(Df(k)-Df0)>3*cfg.sigma_f, nbad=nbad+1; else, nbad=0; end
+        if nbad>=5
+          spoofDet=tk; st(k)=5; nbad=0;
+          events(end+1,:)=[tk,7]; %#ok<AGROW>
+          logd(end+1)={sprintf('t=%6.0fs  СПОУФИНГ детектирован: ГНСС<->RF >3 сигм (SORM: позиция скомпрометирована)',tk)}; %#ok<AGROW>
+        end
+      elseif tk>t_spoof1 && st(k)==5                % восстановление -> P4
+        if abs(Df(k)-Df0)<3*cfg.sigma_f, ngood=ngood+1; else, ngood=0; end
+        if ngood>=3
+          ngood=0; st(k)=4;
+          events(end+1,:)=[tk,8]; %#ok<AGROW>
+          logd(end+1)={sprintf('t=%6.0fs  Восстановлен полный фикс -> P4 GNSS_FIX',tk)}; %#ok<AGROW>
+        end
+      end
+    end
+    % --- конец пролёта: B1-фикс ---
+    if act(max(k-1,1))>0 && act(k)==0
+      if numel(ep)>=80 && ~isempty(coarse)
+        x0=b1_init(ep,coarse.latc,coarse.lonc,cfg,mode,0,0);
+        [xs,cvx]=b1_solve(ep,x0,cfg,mode,true);
+        bridge_p=geod2ecef(xs(1),xs(2),0,cfg);
+        e1=dist_h(bridge_p,pa,cfg);
+        b1fix(end+1,:)=[tk,e1]; b1pos(end+1,:)=[xs(1),xs(2)]; b1cov=cvx(1:2,1:2);
+        events(end+1,:)=[tk,5]; %#ok<AGROW>
+        logd(end+1)={sprintf('t=%6.0fs  B1-фикс: err=%.0f м (%s) -> мост обновлён',tk,e1,mode)}; %#ok<AGROW>
+      end
+      ep=ep_empty();
+    end
+  end
+  % --- ошибки оценок ---
+  if all(~isnan(freeze_p)), fzE(k)=dist_h(freeze_p,pa,cfg); end
+  if all(~isnan(bridge_p)), brE(k)=dist_h(bridge_p,pa,cfg); end
+end
+
+tsn=(passB1.t0+passB1.t1)/2;
+% FIX-4: поля sim присваиваются явно (struct() с cell-полем 'log' создал бы
+% массив структур размером numel(logd) вместо скалярной структуры)
+sim=struct();
+sim.t=t; sim.st=st; sim.JS=JS; sim.cn0g=cn0g;
+sim.gnE=gnE; sim.brE=brE; sim.fzE=fzE;
+sim.elv=elv; sim.cn0dl=cn0dl; sim.snr=snr;
+sim.fdT=fdT; sim.fdP=fdP; sim.fdM=fdM; sim.Df=Df; sim.rttM=rttM;
+sim.latA=latA; sim.lonA=lonA;
+sim.events=events; sim.log=logd;
+sim.prIn=prIn; sim.passB1=passB1; sim.passSp=passSp; sim.pbIdx=pbIdx;
+sim.coarse=coarse; sim.b1fix=b1fix; sim.b1pos=b1pos; sim.b1cov=b1cov;
+sim.jamDet=jamDet; sim.fixLost=fixLost; sim.spoofDet=spoofDet;
+sim.t_scene=tsn; sim.epB1=epB1;
+pg=geo_all(scene.geo_lam,tsn,cfg); sim.geo_snapshot=pg;
+[pl,~]=leo_state(scene.leo_u0,scene.leo_Om0,scene.leo_a,scene.leo_i,tsn,cfg);
+sim.leo_snapshot=pl;
+iSc=find(t>=tsn,1); if isempty(iSc), iSc=numel(t); end
+sim.pa_scene=geod2ecef(latA(iSc),lonA(iSc),0,cfg);
+sim.sat_scene=passB1.sat;
+end
+
+% ---------------- B1: детерминированный разбор + Монте-Карло -------------
+function b1=b1_analysis(cfg,scene,sim,pr24)
+ep=sim.epB1; K=numel(ep); Kg=20:20:K;
+errS=zeros(size(Kg)); errM=errS; errR=errS;
+for i=1:numel(Kg)
+  e=ep(1:Kg(i));
+  x0=b1_init(e,sim.coarse.latc,sim.coarse.lonc,cfg,'static',0,0);
+  xs=b1_solve(e,x0,cfg,'static',true);
+  tm=e(round(end/2)).t; [lT,loT]=truth_at(sim,tm);
+  errS(i)=b1_err_deg_fix(xs,lT,loT,cfg);
+  x0=b1_init(e,sim.coarse.latc,sim.coarse.lonc,cfg,'move',0,0);
+  xs=b1_solve(e,x0,cfg,'move',true);
+  errM(i)=b1_err_deg_fix(xs,lT,loT,cfg);
+  x0=b1_init(e,sim.coarse.latc,sim.coarse.lonc,cfg,'static',0,0);
+  xs=b1_solve(e,x0,cfg,'static',false);
+  errR(i)=b1_err_deg_fix(xs,lT,loT,cfg);
+end
+b1.det=struct('K',Kg,'errS',errS,'errM',errM,'errR',errR);
+% --- Монте-Карло ---
+Rs=60; Rm=40; eS=zeros(Rs,1); eM=zeros(Rm,1);
+for r=1:Rs, eS(r)=mc_b1_run(cfg,scene,'static',2000+r); end
+for r=1:Rm, eM(r)=mc_b1_run(cfg,scene,'move',  5000+r); end
+b1.mcS=eS; b1.mcM=eM;
+% --- свип sigma_RTT ---
+sv=[0.1 0.3 0.5 1 2]*1e-6; med=zeros(size(sv));
+for i=1:numel(sv)
+  c2=cfg; c2.sigma_RTT=sv(i); ee=zeros(12,1);
+  for r=1:12, ee(r)=mc_b1_run(c2,scene,'static',9000+i*20+r); end
+  med(i)=median(ee,'omitnan');
+end
+b1.sweepS=sv; b1.sweepMed=med;
+% --- TTFF холодного старта ---
+R=300; st0=rand(R,1)*86000; ttff=NaN(R,1);
+for r=1:R
+  c=pr24([pr24.t0]>=st0(r)+cfg.scan_time);
+  if ~isempty(c), ttff(r)=cfg.scan_time+(c(1).t0-st0(r))+cfg.reg_time; end
+end
+b1.ttff=ttff;
+end
+
+function [lat,lon]=truth_at(sim,tk)
+i=find(sim.t>=tk,1); if isempty(i), i=numel(sim.t); end
+lat=sim.latA(i); lon=sim.lonA(i);
+end
+function err=b1_err_deg_fix(x,latT,lonT,cfg)
+err=dist_h(geod2ecef(x(1),x(2),0,cfg),geod2ecef(latT,lonT,0,cfg),cfg);
+end
+
+function err=mc_b1_run(cfg,scene,mode,seed)
+rng(seed); err=NaN;
+for tries=1:40
+  t0=rand*80000;
+  latT=45+25*rand; lonT=30+90*rand;
+  pa0=geod2ecef(latT,lonT,0,cfg);
+  for s=1:cfg.N_LEO
+    [pE0,~,~,~]=leo_state(scene.leo_u0(s),scene.leo_Om0(s),scene.leo_a,scene.leo_i,t0,cfg);
+    el0=geom_multi(pE0,pa0,latT,lonT);
+    if el0>=cfg.elMin+3
+      ep=ep_empty();
+      vE=0; vN=0; spd=cfg.vAuto;
+      if strcmp(mode,'move'), h=rand*360; vE=spd*sind(h); vN=spd*cosd(h); end
+      dph=cfg.sigma_eph_pos*[randn;randn;randn];
+      dvel=cfg.sigma_eph_vel*[randn;randn;randn];
+      [E,Nv,U]=enu_basis(latT,lonT);
+      % векторный расчёт состояний КА на окно 400 с
+      ttv=(t0:t0+400)';
+      [pEv,~,pev,vev]=leo_state(scene.leo_u0(s),scene.leo_Om0(s),...
+          scene.leo_a,scene.leo_i,ttv,cfg);
+      for jj=1:numel(ttv)
+        tt=ttv(jj); pE=pEv(:,jj); pe=pev(:,jj); ve=vev(:,jj);
+        pa=pa0;
+        if strcmp(mode,'move')
+          dtt=tt-t0;
+          pa=geod2ecef(latT+vN*dtt/111320,lonT+vE*dtt/(111320*cosd(latT)),0,cfg);
+        end
+        d=pE-pa; rg=norm(d); uu=d/rg;
+        el=asind(dot(uu,U));
+        if el<cfg.elMin, break; end
+        pa_eci=ecef2eci(pa,tt,cfg);
+        va_eci=ecef2eci(E*vE+Nv*vN,tt,cfg)+cross([0;0;cfg.wE],pa_eci);
+        fd=-cfg.fDL/cfg.c*los_rate(pe,ve,pa_eci,va_eci);
+        rtt=2*rg/cfg.c+cfg.sigma_RTT*randn+(rand-0.5)*2*cfg.TA_q;
+        ep(end+1)=struct('t',tt,'ps_ecef',pE+dph,'ps_eci',pe+dph,...
+            'vs_eci',ve+dvel,'rho',cfg.c*rtt/2,'rr',-fd*cfg.c/cfg.fDL+...
+            cfg.sigma_f*cfg.c/cfg.fDL*randn); %#ok<AGROW>
+      end
+      if numel(ep)>=120
+        % истина — позиция АТ в средней эпохе
+        mid=round(numel(ep)/2); dtm=ep(mid).t-t0;
+        lT=latT+vN*dtm/111320; loT=lonT+vE*dtm/(111320*cosd(latT));
+        [ph0,lo0]=ecef2geod(pa0+[30e3;0;0],cfg);
+        x0=b1_init(ep,ph0,lo0,cfg,mode,0,0);
+        xs=b1_solve(ep,x0,cfg,mode,true);
+        err=b1_err_deg_fix(xs,lT,loT,cfg);
+        return
+      end
+    end
+  end
+end
+end
+
+% ---------------- предкомпенсация tau/dF ---------------------------------
+function pre=predcomp_analysis(cfg,scene,sim)
+p=sim.passB1; s=p.sat;
+msk=sim.t>=p.t0 & sim.t<=p.t1;
+tt=sim.t(msk); fdT=sim.fdT(msk); fdP=sim.fdP(msk);
+pre.t=tt-p.t0; pre.fdT=fdT; pre.fdP=fdP; pre.res=fdT-fdP;
+% TA-невязки: грубый фикс и B1-фикс
+paC=geod2ecef(sim.coarse.latc,sim.coarse.lonc,0,cfg);
+if ~isempty(sim.b1pos)
+  paB=geod2ecef(sim.b1pos(1,1),sim.b1pos(1,2),0,cfg);
+else
+  paB=paC;
+end
+rC=zeros(numel(tt),1); rT=rC; rB=rC;
+for i=1:numel(tt)
+  [pE,~]=leo_state(scene.leo_u0(s),scene.leo_Om0(s),scene.leo_a,scene.leo_i,tt(i),cfg);
+  idx=find(sim.t==tt(i),1);
+  pa=geod2ecef(sim.latA(idx),sim.lonA(idx),0,cfg);
+  rT(i)=norm(pE-pa); rC(i)=norm(pE-paC); rB(i)=norm(pE-paB);
+end
+pre.tauC=(rT-rC)/cfg.c; pre.tauB=(rT-rB)/cfg.c;
+% свип: остаточный dF vs ошибка позиции
+dxl=[5 10 20 50 100 200]*1e3; pre.dx=dxl; pre.resMax=zeros(size(dxl));
+psi=rand*360; [E,N]=enu_basis(sim.coarse.latc,sim.coarse.lonc);
+for i=1:numel(dxl)
+  paOff=paC+dxl(i)*(cosd(psi)*E+sind(psi)*N);
+  rm=0;
+  for j=1:numel(tt)
+    [pE,~,pe,ve]=leo_state(scene.leo_u0(s),scene.leo_Om0(s),scene.leo_a,scene.leo_i,tt(j),cfg);
+    paO_eci=ecef2eci(paOff,tt(j),cfg);
+    fdO=-cfg.fDL/cfg.c*los_rate(pe,ve,paO_eci,cross([0;0;cfg.wE],paO_eci));
+    rm=max(rm,abs(fdT(j)-fdO));
+  end
+  pre.resMax(i)=rm;
+end
+pre.fdot=(cfg.fDL/cfg.c)*(cfg.mu/cfg.aLEO^2);
+pre.vg=6.9e3;
+dA=0:0.01:3; pre.pdA=dA; pre.pLoss=point_loss(dA,cfg.theta3);
+end
+
+% ---------------- канал ---------------------------------------------------
+function ch=channel_analysis(cfg,sim)
+ch.r=(300:100:42000)*1e3;
+ch.fsplDL=arrayfun(@(x)fspl(x,cfg.fDL),ch.r);
+ch.fsplUL=arrayfun(@(x)fspl(x,cfg.fUL),ch.r);
+elv=27.5:1:90;
+rr=arrayfun(@(e) -cfg.Re*sind(e)+sqrt((cfg.Re*sind(e))^2+cfg.aLEO^2-cfg.Re^2),elv);
+ch.el=elv; ch.range=rr;
+ch.cn0clr=arrayfun(@(e,r) cn0_leo(r,e,0,cfg),elv,rr);
+ch.cn0rain=arrayfun(@(e,r) cn0_leo(r,e,rain_loss(e,cfg)),elv,rr);
+ch.snrGrid=-10:0.1:25;
+ch.mcsReq=-5.5+0.55*(0:28);
+op=sim.snr(sim.snr>-90 & ~isnan(sim.snr));
+if isempty(op), ch.opSNR=NaN; else, ch.opSNR=median(op); end
+end
+
+% ---------------- визуализация --------------------------------------------
+function y=wrapdeg(x), y=mod(x+180,360)-180; end
+
+function [ex,ey]=cov_ellipse(cx,cy,C,nsig)
+[V,D]=eig(C); d=diag(D); [mx,ix]=max(d); mn=min(d);
+a=nsig*sqrt(mx); b=nsig*sqrt(mn); ang=atan2d(V(2,ix),V(1,ix));
+th=linspace(0,2*pi,73);
+ex=cx+a*cosd(ang)*cos(th)-b*sind(ang)*sin(th);
+ey=cy+a*cosd(ang)*sin(th)+b*sind(ang)*cos(th);
+end
+
+function viz_scene(cfg,scene,sim) %#ok<INUSD>
+figure('Name','Рис.1 Сцена и сценарий','Color','w','Position',[40 40 1250 780]);
+axes('Position',[0.02 0.05 0.58 0.9]); hold on; grid on;
+[X,Y,Z]=sphere(48); R=cfg.Re/1e3;
+surf(R*X,R*Y,R*Z,'FaceColor',[0.25 0.45 0.75],'EdgeColor','none','FaceAlpha',0.9);
+th=linspace(0,2*pi,361); rg=cfg.aGEO/1e3;
+plot3(rg*cos(th),rg*sin(th),0*th,'k-','LineWidth',1);
+pg=sim.geo_snapshot/1e3; pl=sim.leo_snapshot/1e3;
+plot3(pg(1,:),pg(2,:),pg(3,:),'k.','MarkerSize',3);
+plot3(pl(1,:),pl(2,:),pl(3,:),'r.','MarkerSize',5);
+ps=pl(:,sim.sat_scene); pa=sim.pa_scene/1e3;
+plot3(pa(1),pa(2),pa(3),'gs','MarkerSize',10,'MarkerFaceColor','g');
+plot3([pa(1) ps(1)],[pa(2) ps(2)],[pa(3) ps(3)],'m-','LineWidth',1.5);
+plot3(ps(1),ps(2),ps(3),'mo','MarkerFaceColor','m','MarkerSize',8);
+legend({'Земля','орбита ГСО','ГСО (600)','LEO (250)','АТ','луч АТ<->LEO','обслуж. КА'},...
+    'Location','northeast');
+iSt=find(sim.t>=sim.t_scene,1); if isempty(iSt), iSt=numel(sim.t); end
+title(sprintf('Сцена: t=%.0f c, состояние P%d, пролёт B1',...
+    sim.t_scene,sim.st(iSt)));
+axis equal; view(38,22); camlight; lighting gouraud;
+% --- локальный зум ---
+axes('Position',[0.63 0.55 0.34 0.4]); hold on; grid on;
+scatter(sim.lonA(iSt),sim.latA(iSt),50,'g','filled','DisplayName','истина');
+if ~isempty(sim.coarse)
+  scatter(sim.coarse.lonc,sim.coarse.latc,50,'r','filled','DisplayName','ГСО-фикс');
+  % FIX-5: cov задана для (lat,lon) -> переводим к (lon,lat)
+  Cll=[0 1;1 0]*sim.coarse.cov*[0 1;1 0];
+  [ex,ey]=cov_ellipse(sim.coarse.lonc,sim.coarse.latc,36*Cll,2);
+  plot(ex,ey,'r--','DisplayName','2\sigma эллипс');
+end
+if ~isempty(sim.b1pos)
+  scatter(sim.b1pos(:,2),sim.b1pos(:,1),40,'b','filled','DisplayName','B1-фикс');
+end
+legend('Location','southwest'); xlabel('долгота,°'); ylabel('широта,°');
+title('Локальный зум: грубый фикс и B1');
+end
+
+function viz_tracks(cfg,scene)
+figure('Name','Рис.2 Ground-tracks LEO (24 ч)','Color','w'); hold on; grid on;
+idx=1:10:cfg.N_LEO; tt=(0:60:86400);
+for s=idx
+  [pE,~]=leo_state(scene.leo_u0(s),scene.leo_Om0(s),scene.leo_a,scene.leo_i,tt,cfg);
+  [la,lo]=ecef2geod(pE,cfg);
+  plot(lo,la,'-','LineWidth',0.5);
+end
+plot(cfg.atLon,cfg.atLat,'gs','MarkerFaceColor','g','MarkerSize',10);
+psi=acosd(cfg.Re/cfg.aLEO*cosd(cfg.elMin))-cfg.elMin;
+pa=geod2ecef(cfg.atLat,cfg.atLon,0,cfg); [E,N]=enu_basis(cfg.atLat,cfg.atLon);
+th=linspace(0,2*pi,181);
+pf=pa+cfg.Re*(cosd(psi)*(pa/norm(pa))+(E*cos(th)+N*sin(th)));
+[la2,lo2]=ecef2geod(pf,cfg);
+plot(lo2,la2,'g--','LineWidth',1.5);
+xlabel('долгота,°'); ylabel('широта,°');
+title(sprintf('Ground-tracks (i=%g°, каждый 10-й КА); зона радиусом ~%.0f км (el\\geq%.1f°)',cfg.iLEO,cfg.Re*sind(psi)*pi/180/1e3,cfg.elMin));
+xlim([-20 180]); ylim([30 80]);
+end
+
+function viz_availability(vis,tt24,pr24)
+figure('Name','Рис.3 Доступность LEO','Color','w');
+subplot(2,1,1); plot(tt24/3600,vis,'b'); grid on;
+xlabel('время, ч'); ylabel('видимых КА (el\geq27.5°)');
+title(sprintf('Доступность: %.0f%% времени; медиана %.0f КА',100*mean(vis>0),median(vis)));
+subplot(2,1,2); grid on;
+xlabel('max угол места за пролёт,°'); ylabel('пролётов за 24 ч');
+if ~isempty(pr24)                       % FIX-5: защита от пустого набора
+    histogram([pr24.elmax],20);
+    title(sprintf('Пролётов: %d, медиана длительности %.0f с',numel(pr24),median([pr24.dur])));
+else
+    title('Пролётов (dur\geq120 c): 0');
+end
+end
+
+function viz_gso(cal,mcc,sim)
+figure('Name','Рис.4-5 ГСО-пеленгация','Color','w');
+subplot(1,2,1); plot(cal.phi,cal.el,'b','LineWidth',1.5); hold on; grid on;
+plot(55.75,interp1(cal.phi,cal.el,55.75),'ro','MarkerFaceColor','r');
+plot(44,interp1(cal.phi,cal.el,44),'ro','MarkerFaceColor','r');
+text(56.5,interp1(cal.phi,cal.el,55.75),'26.5° @ Мск');
+text(45,interp1(cal.phi,cal.el,44),'~39° @ юг');
+xlabel('широта АТ,°'); ylabel('угол места ГСО (dl=0),°');
+title('Калибровка угломера: el(широтa)');
+subplot(1,2,2);
+plot(mcc.sigL,mcc.errMed(:,1),'-o',mcc.sigL,mcc.errMed(:,2),'-s',...
+     mcc.sigL,mcc.errMed(:,3),'-^',mcc.sigL,mcc.errMed(:,4),'-d','LineWidth',1.2);
+grid on; xlabel('\sigma угломера,°'); ylabel('ошибка грубого фикса, м');
+legend('N=2','N=3','N=4','N=6'); title('Точность ГСО-пеленга (Монте-Карло)');
+ylim([0 2e5]);
+if ~isempty(sim.coarse)
+  fprintf('Сценарий: грубый фикс err=%.1f км (норма 10-100 км)\n',sim.coarse.err/1e3);
+end
+end
+
+function viz_predcomp(pre,sim,cfg) %#ok<INUSD>
+figure('Name','Рис.6 Предкомпенсация dF','Color','w');
+plot(pre.t,pre.fdT/1e3,'b',pre.t,pre.fdP/1e3,'g--',pre.t,pre.res/1e3,'r'); grid on;
+yline(cfg.dFmax/1e3,'k:','+270 кГц'); yline(-cfg.dFmax/1e3,'k:','-270 кГц');
+xlabel('t от начала пролёта, с'); ylabel('доплер, кГц');
+legend('истинный','прогноз по ГСО-фиксу','остаток');
+title('Захват DL: остаточный доплер в допуске RF-022 (±270 кГц)');
+figure('Name','Рис.7 Остаток dF vs ошибка позиции','Color','w');
+plot(pre.dx/1e3,pre.resMax/1e3,'ro','MarkerFaceColor','r'); hold on; grid on;
+plot(pre.dx/1e3,pre.fdot*pre.dx/pre.vg/1e3,'b-','LineWidth',1.2);
+yline(cfg.dFmax/1e3,'k:','допуск ±270 кГц');
+xline(100); text(102,5,'≈4.7 кГц @ 100 км');
+xlabel('ошибка позиции, км'); ylabel('макс. остаточный dF, кГц');
+legend('модель (пролёт)','аналитика f_d·\Deltax/v_{ground}');
+title('Остаточный доплер vs ошибка грубой позиции');
+figure('Name','Рис.8 TA и наведение','Color','w');
+subplot(1,2,1);
+plot(pre.t,pre.tauC*1e6,'r',pre.t,pre.tauB*1e9,'b'); grid on;
+yline(cfg.taumax*1e9,'k:','+295 нс (RF-011)'); yline(-cfg.taumax*1e9,'k:');
+xlabel('t от начала пролёта, с'); ylabel('невязка TA');
+legend('по грубому фиксу, мкс','по B1-фиксу, нс');
+title('Предкомпенсация \tau (точная - после точного фикса)');
+subplot(1,2,2);
+plot(pre.pdA,pre.pLoss,'b','LineWidth',1.2); hold on; grid on;
+xline(cfg.pointMax,'k:','бюджет 0.25°');
+xline(cfg.theta3/2,'m:','1/2 ДН (FUN-009)');
+xlabel('ошибка наведения,°'); ylabel('потери, дБ');
+title('Потери наведения vs ошибка (ДН АФАР)');
+end
+
+function viz_channel(ch,sim,cfg)
+figure('Name','Рис.9 Канал','Color','w');
+subplot(1,3,1); plot(ch.r/1e3,ch.fsplDL,'b',ch.r/1e3,ch.fsplUL,'r'); grid on;
+xlabel('дальность, км'); ylabel('FSPL, дБ'); legend('DL 11.7 ГГц','UL 14.2 ГГц');
+title('Пространственные потери');
+subplot(1,3,2); plot(ch.el,ch.cn0clr,'b',ch.el,ch.cn0rain,'r'); grid on;
+xlabel('угол места,°'); ylabel('C/N_0, дБ·Гц'); legend('ясно','дождь 22 мм/ч');
+title('Энергетика DL LEO\rightarrowАТ');
+subplot(1,3,3);
+for k0=0:7:28
+  plot(ch.snrGrid,1./(1+exp(1.8*(ch.snrGrid-ch.mcsReq(k0+1)))),'Color',[.8 .8 .8]); hold on;
+end
+plot(ch.snrGrid,1./(1+exp(1.8*(ch.snrGrid-ch.mcsReq(21)))),'b','LineWidth',1.5);
+if ~isnan(ch.opSNR), xline(ch.opSNR,'m','раб. точка'); end
+grid on;
+xlabel('SNR (400 МГц), дБ'); ylabel('BLER'); ylim([0 1]);
+title('BLER(SINR), MCS 0..28 (RF-012/013, RF-010: BLER\leq0.1)');
+figure('Name','Рис.10 Профиль пролёта','Color','w');
+msk=sim.t>=sim.passB1.t0 & sim.t<=sim.passB1.t1; tt=sim.t(msk)-sim.passB1.t0;
+subplot(1,3,1); plot(tt,sim.rttM(msk)); grid on;
+xlabel('t, с'); ylabel('RTT, мс'); title('RTT(t)');
+subplot(1,3,2); plot(tt,sim.fdT(msk)/1e3,'b',tt,sim.fdM(msk)/1e3,'r.'); grid on;
+xlabel('t, с'); ylabel('доплер, кГц'); legend('истина','измерение'); title('S-кривая доплера');
+subplot(1,3,3);
+f=(-cfg.dFmax:1e3:cfg.dFmax);
+res=median(sim.fdM(msk)-sim.fdP(msk),'omitnan');
+plot(f/1e3,0.3*exp(-((f-res)/1.2e3).^2)+0.02*randn(size(f))); grid on;
+xlabel('частотный сдвиг, кГц'); ylabel('CAF');
+title('Пик захвата SSB в окне ±270 кГц');
+end
+
+function viz_b1(b1,cfg) %#ok<INUSD>
+figure('Name','Рис.11 Сходимость B1','Color','w');
+plot(b1.det.K,b1.det.errS,'-o',b1.det.K,b1.det.errM,'-s',b1.det.K,b1.det.errR,'-^');
+grid on; xlabel('число эпох (1 с)'); ylabel('ошибка позиции, м');
+legend('статика: \rho+\Delta f','движение 250 км/ч: \rho+\Delta f','статика: только \rho');
+title('Сходимость B1-засечки по одному КА (пролёт сценария)');
+figure('Name','Рис.14 Монте-Карло B1','Color','w');
+subplot(1,2,1);
+es=sort(b1.mcS(~isnan(b1.mcS))); em=sort(b1.mcM(~isnan(b1.mcM)));
+plot(es,(1:numel(es))'/numel(es),'b','LineWidth',1.5); hold on;
+plot(em,(1:numel(em))'/numel(em),'r','LineWidth',1.5);
+xline(50,'k:','50 м (цель)'); xline(150,'m:','150 м (B1)'); xline(300,'m:');
+xline(20,'g:','20-100 м (B2)');
+grid on; xlabel('ошибка, м'); ylabel('CDF');
+legend('статика','движение'); title('CEP: B1 по одному КА (Монте-Карло)');
+fprintf('B1 Монте-Карло: статика CEP50=%.0f м CEP95=%.0f м; движение CEP50=%.0f м CEP95=%.0f м\n',...
+    median(b1.mcS,'omitnan'),prctile_(b1.mcS,95),...
+    median(b1.mcM,'omitnan'),prctile_(b1.mcM,95));
+subplot(1,2,2);
+semilogy(b1.sweepS*1e6,b1.sweepMed,'-o','LineWidth',1.3); grid on;
+xlabel('\sigma_{RTT}, мкс'); ylabel('медианная ошибка B1, м');
+title('Чувствительность к точности RTT');
+yline(150,'m:'); yline(300,'m:');      % FIX-5: два отдельных yline
+end
+
+function p=prctile_(x,q)
+x=sort(x(~isnan(x)));
+if isempty(x), p=NaN; return; end      % FIX-5: защита от пустых данных
+p=x(max(1,min(numel(x),round(q/100*numel(x)))));
+end
+
+function viz_timeline(sim,cfg)
+figure('Name','Рис.12 Сценарий: состояния и ошибки','Color','w');
+subplot(4,1,1); stairs(sim.t/60,sim.st,'b','LineWidth',1.2); grid on; ylim([-0.5 7.5]);
+yticks(0:7); yticklabels({'P0','P1','P2','P3','P4','P5','P6','P7'});
+hold on;
+evlNames={'джамминг','фикс потерян','ГСО-фикс','DL захвачен',...
+    'B1-фикс','(резерв)','спуфинг','P4 восст.'};
+for i=1:size(sim.events,1)
+  xline(sim.events(i,1)/60,'r--');
+  text(sim.events(i,1)/60,7.2,evlNames{sim.events(i,2)},'Rotation',90,'FontSize',7);
+end
+title('Автомат состояний P0..P7 (джамминг -> RF_HOLD -> B1 -> спуфинг)');
+subplot(4,1,2);
+semilogy(sim.t/60,sim.gnE,'g',sim.t/60,sim.fzE,'k',sim.t/60,sim.brE,'b'); grid on;
+hold on; plot(sim.b1fix(:,1)/60,sim.b1fix(:,2),'mo','MarkerFaceColor','m');
+xlabel('t, мин'); ylabel('ошибка, м');
+legend('ГНСС','мост «заморожен»','мост RF (B1)','B1-фиксы');
+title('Ошибки позиции: рост «моста» линеен (~v·\Deltat), RF-мост ограничивает B1-точностью');
+subplot(4,1,3);
+plot(sim.t/60,sim.JS,'r',sim.t/60,sim.cn0g,'b'); grid on;
+yline(45-15,'k:','детекция (15 дБ)'); yline(45-30,'k:','потеря фикса (30 дБ)');
+xlabel('t, мин'); ylabel('дБ'); legend('J/S','C/N_0 ГНСС');
+title('Подавление ГНСС (Фаза III)');
+subplot(4,1,4);
+plot(sim.t/60,sim.cn0dl,'b',sim.t/60,sim.snr,'r'); grid on;
+xlabel('t, мин'); ylabel('дБ'); legend('C/N_0 DL','SNR (400 МГц)');
+title('Канал LEO: сеанс не прерывается (SINR-контур автономен)');
+figure('Name','Рис.13 Целостность','Color','w');
+subplot(2,1,1);
+plot(sim.t/60,sim.Df,'b'); hold on; grid on;
+yline(3*cfg.sigma_f,'r:','+3\sigma'); yline(-3*cfg.sigma_f,'r:','-3\sigma');
+if ~isnan(sim.spoofDet), xline(sim.spoofDet/60,'m','спуфинг детект.'); end
+xlabel('t, мин'); ylabel('\Delta f невязка ГНСС<->RF, Гц');
+title('Кросс-сверка доплера: детекция подмены PVT (Фаза IV)');
+subplot(2,1,2);
+plot(sim.t/60,(sim.t*0+1)*cfg.opp_ppm*1e-6*cfg.fDL/1e3*sim.t/max(sim.t),'k'); grid on;
+xlabel('t, мин'); ylabel('уход опоры, кГц');
+title(sprintf('Holdover: дрейф опоры \\leq%.0f ppm \\rightarrow \\leq%.1f кГц @ %.0f ГГц (внутри ±270 кГц)',...
+    cfg.opp_ppm,cfg.opp_ppm*1e-6*cfg.fDL/1e3,cfg.fDL/1e9));
+end
+
+function viz_summary(sim,b1,mcc)
+figure('Name','Рис.15 Сводка','Color','w');
+subplot(1,2,1);
+vals=[median(sim.gnE(sim.gnE<2e3&~isnan(sim.gnE)),'omitnan'), ...
+      median(b1.mcS,'omitnan'), median(b1.mcM,'omitnan'), ...
+      0.35*median(b1.mcS,'omitnan'), median(mcc.errMed(end,2))];
+bar(vals,'FaceColor','flat'); set(gca,'YScale','log'); grid on;
+for i=1:4
+  if ~isnan(vals(i))
+    text(i,vals(i)*1.2,sprintf('%.0f м',vals(i)),'HorizontalAlignment','center');
+  end
+end
+if ~isnan(vals(5))
+  text(5,vals(5)*1.2,sprintf('%.0f км',vals(5)/1e3),'HorizontalAlignment','center');
+end
+set(gca,'XTick',1:5,'XTickLabel',{'ГНСС','B1 стат.','B1 движ.','B2 (эмуляция)','луч ГСО'});
+title('Точность по источникам (медианы)');
+subplot(1,2,2);
+tth=b1.ttff(~isnan(b1.ttff))/60;        % FIX-5: защита от пустых данных
+if isempty(tth), tth=0; end
+histogram(tth,30); hold on; grid on;
+xline(15,'r','15 мин (холодный)'); xline(3,'m','3 мин'); xline(0.5,'b','30 с');
+xlabel('TTFF, мин'); ylabel('случаев');
+title('Холодный старт без ГНСС: скан+ожидание пролёта+регистрация');
+end
+
+function print_sorm(logd)
+fprintf('\n===== SORM-ОТЧЁТНОСТЬ (журнал событий) =====\n');
+for i=1:numel(logd), fprintf('%s\n',logd{i}); end
+fprintf('=============================================\n');
+end
