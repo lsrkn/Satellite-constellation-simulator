@@ -1,23 +1,16 @@
 %% ========================================================================
-%  main_AT_sim.m  (ИСПРАВЛЕННАЯ ВЕРСИЯ 6, R2018b+ / проверено под R2021b)
+%  main_AT_sim.m  (ВЕРСИЯ 8, R2018b+ / проверено под R2021b)
 %  Имитационная модель определения местоположения АТ "Большой" (метод Р3SE)
 %
 %  ЗАПУСК: сохранить файл и запустить ЦЕЛИКОМ (Run / F5). По секциям
 %  (Ctrl+Enter) не запускать: локальные функции скрипта видны только при
 %  запуске всего файла.
 %
-%  Исправления:
-%   FIX-1..FIX-6 - geo_all (конкатенация/геостационарность), leo_state
-%                  (поэлементное вращение, t->строка), b1_resid (E_vN_va),
-%                  sim (явные поля), защита от пустых данных, cn0_leo
-%                  (4 аргумента, без двойного дождя).
-%   FIX-7 run_scenario - блок "конец пролёта: B1-фикс" был ВНУТРИ
-%                  "if act(k)>0" при условии act(k)==0 -> никогда не
-%                  выполнялся (b1fix пуст, легенда ругалась, мост не
-%                  обновлялся). Вынесен из блока.
-%   FIX-8 viz_timeline - (sim.t*0+1)*...*sim.t: mtimes двух столбцов N×1
-%                  -> ошибка размерностей. Убран лишний множитель-единицы.
-%   FIX-9 viz_timeline - число подписей легенды = числу кривых.
+%  FIX-11: в build_journal таблица событий падала ("All table variables
+%  must have the same number of rows"): evName(idx) при "строчном" evName
+%  возвращает строку 1×ne (MATLAB сохраняет ориентацию источника-вектора).
+%  Теперь ВСЕ переменные всех таблиц журнала принудительно приводятся к
+%  столбцам через (:).
 %% ========================================================================
 clear; close all; clc; rng(7);
 
@@ -37,6 +30,10 @@ fprintf('Доступность LEO за 24ч: %.1f%%, пролётов: %d, м�
 %% ---------------- 4. ОСНОВНОЙ СЦЕНАРИЙ S2-S4 ---------------------------
 sim = run_scenario(cfg, scene);
 print_sorm(sim.log);
+
+%% ---------------- 4б. ЖУРНАЛ: ТАБЛИЦЫ СОСТОЯНИЙ И ПАРАМЕТРОВ ----------
+jrn = build_journal(cfg, scene, sim);
+print_journal(jrn, cfg);
 
 %% ---------------- 5. ГСО-ПЕЛЕНГ: калибровка + Монте-Карло --------------
 cal = gso_calibration(cfg, scene);
@@ -106,6 +103,7 @@ cfg.T_end=4200; cfg.dt=1;
 cfg.jam_t0=600; cfg.jam_ramp=60; cfg.jam_JS=40;
 cfg.scan_time=60; cfg.reg_time=8;
 cfg.spoof_off=10e3;
+cfg.journal_dt=30;   % шаг печати журнала состояний, с (1 = каждую секунду)
 end
 
 function scene = build_scene(cfg)
@@ -179,7 +177,6 @@ end
 
 % ------------------------- движение КА ----------------------------------
 function [pE,vE,pe,ve]=leo_state(u0,Om0,a,inc,t,cfg)
-% FIX-2: t -> строка; вращение ECI->ECEF поэлементное (.*)
 t=t(:)';
 n=sqrt(cfg.mu/a^3); th=gmst(t,cfg);
 u =u0(:)' + n*t;
@@ -194,7 +191,6 @@ vE=[c.*vrel(1,:)+s.*vrel(2,:); -s.*vrel(1,:)+c.*vrel(2,:); vrel(3,:)];
 end
 
 function pE=geo_all(lamDeg,t,cfg)
-% FIX-1: ГСО неподвижна в ECEF; размер строки z согласован с cL
 u=cfg.wE*t; si=sind(cfg.geoInc);
 cL=cosd(lamDeg(:))'; sL=sind(lamDeg(:))';
 pE=cfg.aGEO*[cL; sL; si*sin(u)*ones(size(cL))];
@@ -222,7 +218,6 @@ A=g*L;
 end
 function L=point_loss(dA,th3), L=min(12*(dA/th3).^2,25); end
 function cn0=cn0_leo(r,el,Lp,cfg)
-% 4 аргумента; rain_loss(el,cfg) уже учтён внутри
 cn0=cfg.EIRP_LEO+cfg.GT_AT-fspl(r,cfg.fDL)-atm_loss(el)-rain_loss(el,cfg)...
     -0.2-Lp+228.6;
 end
@@ -404,7 +399,6 @@ end
 
 % ---------------- основной сценарий --------------------------------------
 function sim=run_scenario(cfg,scene)
-% --- расписание событий ---
 pr=get_passes(cfg,scene,cfg.T_end,10,120);
 H=cfg.T_end;
 c1=pr([pr.t0]>=cfg.jam_t0+cfg.jam_ramp & [pr.dur]>=120);
@@ -430,13 +424,15 @@ pbIdx=find([prIn.t0]==passB1.t0); if ~isempty(pbIdx), pbIdx=pbIdx(1); end
 psIdx=find([prIn.t0]==passSp.t0); if ~isempty(psIdx), psIdx=psIdx(1); end
 
 mode='static'; if strcmp(cfg.mob,'auto'), mode='move'; end
-slope=(2*rand-1)*cfg.opp_ppm*1e-6*cfg.fDL/3600;   % дрейф опоры, Гц/с
+slope=(2*rand-1)*cfg.opp_ppm*1e-6*cfg.fDL/3600;
 
 st=zeros(N,1); st(:)=-1;
 JS=zeros(N,1); cn0g=NaN(N,1);
 gnE=NaN(N,1); brE=NaN(N,1); fzE=NaN(N,1);
 elv=NaN(N,1); cn0dl=NaN(N,1); snr=NaN(N,1);
 fdT=NaN(N,1); fdP=NaN(N,1); fdM=NaN(N,1); Df=NaN(N,1); rttM=NaN(N,1);
+actSat=zeros(N,1); spoOff=zeros(N,1);
+nvis=zeros(N,1);  ngeo=zeros(N,1);
 logd={}; events=zeros(0,2);
 bridge_p=NaN(3,1); freeze_p=NaN(3,1);
 coarse=[]; ep=ep_empty(); epB1=ep_empty();
@@ -449,6 +445,10 @@ for k=1:N
   pa=geod2ecef(latA(k),lonA(k),0,cfg);
   [E,Nt]=enu_basis(latA(k),lonA(k));
   va=E*vEa(k)+Nt*vNa(k);
+  % --- видимость КА (журнал) ---
+  [pAll,~]=leo_state(scene.leo_u0,scene.leo_Om0,scene.leo_a,scene.leo_i,tk,cfg);
+  nvis(k)=sum(geom_multi(pAll,pa,latA(k),lonA(k))>=cfg.elMin);
+  ngeo(k)=sum(geom_multi(geo_all(scene.geo_lam,tk,cfg),pa,latA(k),lonA(k))>=cfg.elMinGEO);
   % --- помеха ---
   if tk>=cfg.jam_t0 && tk<t_gnss_on
     js=min(cfg.jam_JS,(tk-cfg.jam_t0)/cfg.jam_ramp*cfg.jam_JS);
@@ -461,6 +461,7 @@ for k=1:N
   if tk>=t_spoof0 && tk<=t_spoof1
     spo=cfg.spoof_off*min(1,(tk-t_spoof0)/spoof_ramp);
   end
+  spoOff(k)=spo;
   % --- ГНСС-оценка ---
   gpos=pa+spo*(cosd(35)*E+sind(35)*Nt);
   if gnss_ok
@@ -500,6 +501,7 @@ for k=1:N
   % --- RF-измерения при активном пролёте ---
   if act(k)>0
     m=act(k); s=prIn(m).sat;
+    actSat(k)=s;
     [pE,vE,pe,ve]=leo_state(scene.leo_u0(s),scene.leo_Om0(s),scene.leo_a,scene.leo_i,tk,cfg);
     [el,~,rg]=geom_multi(pE,pa,latA(k),lonA(k));
     pa_eci=ecef2eci(pa,tk,cfg);
@@ -512,35 +514,30 @@ for k=1:N
     if any(isnan(bridge_p)), Lp=0; end
     cn0dl(k)=cn0_leo(rg,el,Lp,cfg);
     snr(k)=cn0dl(k)-10*log10(cfg.BW)-cfg.I_margin;
-    if ~isempty(coarse)   % прогноз доплера по грубой позиции
+    if ~isempty(coarse)
       paC=geod2ecef(coarse.latc,coarse.lonc,0,cfg);
       paC_eci=ecef2eci(paC,tk,cfg);
       fdP(k)=-cfg.fDL/cfg.c*los_rate(pe,ve,paC_eci,cross([0;0;cfg.wE],paC_eci));
     end
-    % --- захват DL в начале пролёта ---
     if act(max(k-1,1))==0 && st(k)>=4
       events(end+1,:)=[tk,4]; %#ok<AGROW>
       logd(end+1)={sprintf('t=%6.0fs  DL захвачен (SSB, предкомп. dF по ГСО-фиксу) -> P3 RF_TRACK',tk)}; %#ok<AGROW>
     end
-    % --- накопление эпох B1 ---
     dph=cfg.sigma_eph_pos*[randn;randn;randn];
     dvel=cfg.sigma_eph_vel*[randn;randn;randn];
     ep(end+1)=struct('t',tk,'ps_ecef',pE+dph,'ps_eci',pe+dph,...
         'vs_eci',ve+dvel,'rho',cfg.c*rtt/2,'rr',-fdM(k)*cfg.c/cfg.fDL); %#ok<AGROW>
     if ~isempty(pbIdx) && m==pbIdx, epB1(end+1)=ep(end); end %#ok<AGROW>
-    % --- кросс-сверка ГНСС<->RF (доплер) ---
     fd_pred_g=-cfg.fDL/cfg.c*los_rate(pe,ve,ecef2eci(gpos,tk,cfg),...
         ecef2eci(va,tk,cfg)+cross([0;0;cfg.wE],pa_eci));
     Df(k)=fdM(k)-fd_pred_g;
-    % --- база невязки до подмены / слежение после подмены ---
     if ~isempty(psIdx) && act(k)==psIdx
       if tk>=t_spoof0-20 && tk<t_spoof0-5
         Df0=median(Df(max(1,k-15):k),'omitnan');
       elseif tk>t_spoof1 && st(k)==5
-        Df0=median(Df(max(1,k-15):k),'omitnan');   % компенсация дрейфа опоры
+        Df0=median(Df(max(1,k-15):k),'omitnan');
       end
     end
-    % --- СПОУФИНГ-контроль ---
     if ~isempty(psIdx) && act(k)==psIdx && st(k)>=4 && ~isnan(Df0) && ~isnan(Df(k))
       if isnan(spoofDet) && tk>=t_spoof0 && tk<=t_spoof1
         if abs(Df(k)-Df0)>3*cfg.sigma_f, nbad=nbad+1; else, nbad=0; end
@@ -549,7 +546,7 @@ for k=1:N
           events(end+1,:)=[tk,7]; %#ok<AGROW>
           logd(end+1)={sprintf('t=%6.0fs  СПОУФИНГ детектирован: ГНСС<->RF >3 сигм (SORM: позиция скомпрометирована)',tk)}; %#ok<AGROW>
         end
-      elseif tk>t_spoof1 && st(k)==5                % восстановление -> P4
+      elseif tk>t_spoof1 && st(k)==5
         if abs(Df(k)-Df0)<3*cfg.sigma_f, ngood=ngood+1; else, ngood=0; end
         if ngood>=3
           ngood=0; st(k)=4;
@@ -559,9 +556,7 @@ for k=1:N
       end
     end
   end
-  % --- конец пролёта: B1-фикс ---
-  % FIX-7: блок вынесен из "if act(k)>0" (внутри него условие act(k)==0
-  % было недостижимо => B1-фиксы никогда не вычислялись, b1fix был пуст)
+  % --- конец пролёта: B1-фикс (вне блока act>0!) ---
   if act(max(k-1,1))>0 && act(k)==0
     if numel(ep)>=80 && ~isempty(coarse)
       x0=b1_init(ep,coarse.latc,coarse.lonc,cfg,mode,0,0);
@@ -574,19 +569,21 @@ for k=1:N
     end
     ep=ep_empty();
   end
-  % --- ошибки оценок ---
   if all(~isnan(freeze_p)), fzE(k)=dist_h(freeze_p,pa,cfg); end
   if all(~isnan(bridge_p)), brE(k)=dist_h(bridge_p,pa,cfg); end
 end
 
 tsn=(passB1.t0+passB1.t1)/2;
-% FIX-4: явное присваивание полей sim
 sim=struct();
 sim.t=t; sim.st=st; sim.JS=JS; sim.cn0g=cn0g;
 sim.gnE=gnE; sim.brE=brE; sim.fzE=fzE;
 sim.elv=elv; sim.cn0dl=cn0dl; sim.snr=snr;
 sim.fdT=fdT; sim.fdP=fdP; sim.fdM=fdM; sim.Df=Df; sim.rttM=rttM;
 sim.latA=latA; sim.lonA=lonA;
+sim.vE=vEa; sim.vN=vNa;
+sim.act=act; sim.actSat=actSat;
+sim.spo=spoOff;
+sim.nvis=nvis; sim.ngeo=ngeo;
 sim.events=events; sim.log=logd;
 sim.prIn=prIn; sim.passB1=passB1; sim.passSp=passSp; sim.pbIdx=pbIdx;
 sim.coarse=coarse; sim.b1fix=b1fix; sim.b1pos=b1pos; sim.b1cov=b1cov;
@@ -618,12 +615,10 @@ for i=1:numel(Kg)
   errR(i)=b1_err_deg_fix(xs,lT,loT,cfg);
 end
 b1.det=struct('K',Kg,'errS',errS,'errM',errM,'errR',errR);
-% --- Монте-Карло ---
 Rs=60; Rm=40; eS=zeros(Rs,1); eM=zeros(Rm,1);
 for r=1:Rs, eS(r)=mc_b1_run(cfg,scene,'static',2000+r); end
 for r=1:Rm, eM(r)=mc_b1_run(cfg,scene,'move',  5000+r); end
 b1.mcS=eS; b1.mcM=eM;
-% --- свип sigma_RTT ---
 sv=[0.1 0.3 0.5 1 2]*1e-6; med=zeros(size(sv));
 for i=1:numel(sv)
   c2=cfg; c2.sigma_RTT=sv(i); ee=zeros(12,1);
@@ -631,7 +626,6 @@ for i=1:numel(sv)
   med(i)=median(ee,'omitnan');
 end
 b1.sweepS=sv; b1.sweepMed=med;
-% --- TTFF холодного старта ---
 R=300; st0=rand(R,1)*86000; ttff=NaN(R,1);
 for r=1:R
   c=pr24([pr24.t0]>=st0(r)+cfg.scan_time);
@@ -705,10 +699,8 @@ p=sim.passB1; s=p.sat;
 msk=sim.t>=p.t0 & sim.t<=p.t1;
 tt=sim.t(msk); fdT=sim.fdT(msk); fdP=sim.fdP(msk);
 pre.t=tt-p.t0; pre.fdT=fdT; pre.fdP=fdP; pre.res=fdT-fdP;
-% TA-невязки: грубый фикс и B1-фикс
 paC=geod2ecef(sim.coarse.latc,sim.coarse.lonc,0,cfg);
 if ~isempty(sim.b1pos)
-  % берём последний B1-фикс, доступный к началу пролёта B1
   ii=find(sim.b1fix(:,1)<=p.t0,1,'last');
   if isempty(ii), ii=1; end
   paB=geod2ecef(sim.b1pos(ii,1),sim.b1pos(ii,2),0,cfg);
@@ -723,7 +715,6 @@ for i=1:numel(tt)
   rT(i)=norm(pE-pa); rC(i)=norm(pE-paC); rB(i)=norm(pE-paB);
 end
 pre.tauC=(rT-rC)/cfg.c; pre.tauB=(rT-rB)/cfg.c;
-% свип: остаточный dF vs ошибка позиции
 dxl=[5 10 20 50 100 200]*1e3; pre.dx=dxl; pre.resMax=zeros(size(dxl));
 psi=rand*360; [E,N]=enu_basis(sim.coarse.latc,sim.coarse.lonc);
 for i=1:numel(dxl)
@@ -750,7 +741,6 @@ ch.fsplUL=arrayfun(@(x)fspl(x,cfg.fUL),ch.r);
 elv=27.5:1:90;
 rr=arrayfun(@(e) -cfg.Re*sind(e)+sqrt((cfg.Re*sind(e))^2+cfg.aLEO^2-cfg.Re^2),elv);
 ch.el=elv; ch.range=rr;
-% FIX-6: cn0_leo требует 4 аргумента и уже вычитает rain_loss внутри
 ch.cn0clr =arrayfun(@(e,r) cn0_leo(r,e,0,cfg)+rain_loss(e,cfg),elv,rr);
 ch.cn0rain=arrayfun(@(e,r) cn0_leo(r,e,0,cfg),elv,rr);
 ch.snrGrid=-10:0.1:25;
@@ -790,7 +780,6 @@ iSt=find(sim.t>=sim.t_scene,1); if isempty(iSt), iSt=numel(sim.t); end
 title(sprintf('Сцена: t=%.0f c, состояние P%d, пролёт B1',...
     sim.t_scene,sim.st(iSt)));
 axis equal; view(38,22); camlight; lighting gouraud;
-% --- локальный зум ---
 axes('Position',[0.63 0.55 0.34 0.4]); hold on; grid on;
 scatter(sim.lonA(iSt),sim.latA(iSt),50,'g','filled','DisplayName','истина');
 if ~isempty(sim.coarse)
@@ -968,7 +957,6 @@ title('Автомат состояний P0..P7 (джамминг -> RF_HOLD -> 
 subplot(4,1,2);
 semilogy(sim.t/60,sim.gnE,'g',sim.t/60,sim.fzE,'k',sim.t/60,sim.brE,'b'); grid on;
 hold on;
-% FIX-9: подписи легенды добавляем только под реально построенные кривые
 lgd={'ГНСС','мост «заморожен»','мост RF (B1)'};
 if ~isempty(sim.b1fix)
     plot(sim.b1fix(:,1)/60,sim.b1fix(:,2),'mo','MarkerFaceColor','m');
@@ -994,7 +982,6 @@ if ~isnan(sim.spoofDet), xline(sim.spoofDet/60,'m','спуфинг детект.
 xlabel('t, мин'); ylabel('\Delta f невязка ГНСС<->RF, Гц');
 title('Кросс-сверка доплера: детекция подмены PVT (Фаза IV)');
 subplot(2,1,2);
-% FIX-8: убран множитель (sim.t*0+1) — было mtimes двух столбцов N×1
 plot(sim.t/60, cfg.opp_ppm*1e-6*cfg.fDL/1e3*sim.t/max(sim.t), 'k'); grid on;
 xlabel('t, мин'); ylabel('уход опоры, кГц');
 title(sprintf('Holdover: дрейф опоры \\leq%.0f ppm \\rightarrow \\leq%.1f кГц @ %.0f ГГц (внутри ±270 кГц)',...
@@ -1032,4 +1019,249 @@ function print_sorm(logd)
 fprintf('\n===== SORM-ОТЧЁТНОСТЬ (журнал событий) =====\n');
 for i=1:numel(logd), fprintf('%s\n',logd{i}); end
 fprintf('=============================================\n');
+end
+
+% ============ ЖУРНАЛ: построение таблиц ==================================
+function jrn=build_journal(cfg,scene,sim)
+% Собирает журнал моделирования в виде таблиц MATLAB (table).
+% FIX-11: все переменные таблиц принудительно приводятся к столбцам (:),
+% т.к. ориентация результата векторного индексирования (например,
+% evName(idx) для "строчного" evName -> строка 1×ne) может не совпадать.
+N=numel(sim.t);
+rngkm=(sim.rttM*1e-3*cfg.c/2)/1e3;          % наклонная дальность АТ<->КА, км
+spd=hypot(sim.vE,sim.vN);
+% ---- 1. Полный журнал состояний (1 строка = 1 с) ----
+jrn.state=table(sim.t(:), sim.st(:), sim.latA(:), sim.lonA(:), spd(:), ...
+    sim.nvis(:), sim.ngeo(:), sim.JS(:), sim.cn0g(:), sim.gnE(:), ...
+    sim.spo(:)/1e3, sim.actSat(:), sim.elv(:), rngkm(:), sim.rttM(:), ...
+    sim.fdT(:)/1e3, sim.fdM(:)/1e3, sim.fdP(:)/1e3, sim.Df(:), ...
+    sim.cn0dl(:), sim.snr(:), sim.brE(:), sim.fzE(:), ...
+    'VariableNames', {'t_s','P','lat_deg','lon_deg','V_mps','nvis_LEO', ...
+    'nvis_GEO','JS_dB','CN0_gnss_dBHz','gnssErr_m','spoof_km','satNo', ...
+    'el_deg','range_km','RTT_ms','fdT_kHz','fdM_kHz','fdP_kHz','Df_Hz', ...
+    'CN0_dl_dBHz','SNR_dB','bridgeErr_m','freezeErr_m'});
+% ---- 2. События ----
+evName={'джамминг','фикс потерян','ГСО-фикс','DL захвачен','B1-фикс',...
+    '(резерв)','спуфинг','P4 восст.'};
+ne=size(sim.events,1);
+msg=strings(ne,1);
+for i=1:min(ne,numel(sim.log)), msg(i)=string(sim.log{i}); end %#ok<PREALL>
+if ne>0
+    evN=string(evName(sim.events(:,2))); evN=evN(:);   % FIX-11: -> столбец
+    evT=sim.events(:,1); evC=sim.events(:,2);
+    jrn.events=table(evT(:), evT(:)/60, evC(:), evN, msg(:), ...
+        'VariableNames', {'t_s','t_min','code','event','message'});
+else
+    jrn.events=table(zeros(0,1),zeros(0,1),zeros(0,1),strings(0,1),strings(0,1),...
+        'VariableNames',{'t_s','t_min','code','event','message'});
+end
+% ---- 3. Пролёты LEO над АТ ----
+np=numel(sim.prIn);
+if np>0
+    p0=[sim.prIn.t0]'; p1=[sim.prIn.t1]'; du=[sim.prIn.dur]';
+    sa=[sim.prIn.sat]'; em=[sim.prIn.elmax]';
+    role=repmat("обычный",np,1);
+    ib=find(p0==sim.passB1.t0,1); if ~isempty(ib), role(ib)="B1: навиг. засечка"; end
+    ig=find(p0==sim.passSp.t0,1); if ~isempty(ig), role(ig)="спуфинг-контроль"; end
+    sa=sa(:);
+    jrn.passes=table((1:np)', p0(:), p1(:), du(:), sa, ...
+        rad2deg(scene.leo_Om0(sa)), rad2deg(scene.leo_u0(sa)), ...
+        em(:), role(:), 'VariableNames', ...
+        {'n','t0_s','t1_s','dur_s','satNo','RAAN_deg','u0_deg','elmax_deg','role'});
+else
+    jrn.passes=table(zeros(0,1),zeros(0,1),zeros(0,1),zeros(0,1),zeros(0,1),...
+        zeros(0,1),zeros(0,1),zeros(0,1),strings(0,1), 'VariableNames', ...
+        {'n','t0_s','t1_s','dur_s','satNo','RAAN_deg','u0_deg','elmax_deg','role'});
+end
+% ---- 4. B1-фиксы ----
+nb=size(sim.b1fix,1);
+if nb>0
+    jrn.b1fix=table((1:nb)', sim.b1fix(:,1), sim.b1pos(:,1), ...
+        sim.b1pos(:,2), sim.b1fix(:,2), 'VariableNames', ...
+        {'n','t_s','lat_deg','lon_deg','err_m'});
+else
+    jrn.b1fix=table(zeros(0,1),zeros(0,1),zeros(0,1),zeros(0,1),zeros(0,1),...
+        'VariableNames',{'n','t_s','lat_deg','lon_deg','err_m'});
+end
+% ---- 5. Параметры сцены/орбит/канала/сценария ----
+Tleo=2*pi*sqrt(cfg.aLEO^3/cfg.mu);
+rows={ ...
+ '[КОНСТЕЛЛЯЦИЯ / ОРБИТЫ]','',''; ...
+ '  Число КА ГСО', sprintf('%.0f',cfg.N_GEO), '-'; ...
+ '  Шаг ГСО по долготе', sprintf('%.2f',cfg.geoSlot), 'град'; ...
+ '  Наклонение ГСО', sprintf('%.2f',cfg.geoInc), 'град'; ...
+ '  Радиус орбиты ГСО', sprintf('%.1f',cfg.aGEO/1e3), 'км'; ...
+ '  Число КА LEO', sprintf('%.0f',cfg.N_LEO), '-'; ...
+ '  Схема LEO (T/P/F)', sprintf('%d/%d/%d',cfg.N_LEO,cfg.LEO_P,cfg.LEO_F), '-'; ...
+ '  Высота LEO', sprintf('%.0f',cfg.hLEO/1e3), 'км'; ...
+ '  Наклонение LEO', sprintf('%.1f',cfg.iLEO), 'град'; ...
+ '  Период обращения LEO', sprintf('%.2f',Tleo/60), 'мин'; ...
+ '  Мин. угол места LEO', sprintf('%.1f',cfg.elMin), 'град'; ...
+ '  Мин. угол места ГСО', sprintf('%.1f',cfg.elMinGEO), 'град'; ...
+ '[АТ]','',''; ...
+ '  Координаты старта', sprintf('%.2fN %.2fE',cfg.atLat,cfg.atLon), '-'; ...
+ '  Режим движения', cfg.mob, '-'; ...
+ '  Скорость (авто)', sprintf('%.0f',cfg.vAuto*3.6), 'км/ч'; ...
+ '  Период смены курса', sprintf('%.0f',cfg.turnP), 'с'; ...
+ '  Амплитуда курса', sprintf('%.0f',cfg.turnA), 'град'; ...
+ '[КАНАЛ СВЯЗИ]','',''; ...
+ '  Частота DL', sprintf('%.1f',cfg.fDL/1e9), 'ГГц'; ...
+ '  Частота UL', sprintf('%.1f',cfg.fUL/1e9), 'ГГц'; ...
+ '  Полоса сигнала', sprintf('%.0f',cfg.BW/1e6), 'МГц'; ...
+ '  EIRP КА LEO', sprintf('%.0f',cfg.EIRP_LEO), 'дБВт'; ...
+ '  G/T терминала АТ', sprintf('%.0f',cfg.GT_AT), 'дБ/К'; ...
+ '  Диаметр антенны АТ', sprintf('%.2f',cfg.Dant), 'м'; ...
+ '  Ширина ДН АТ (theta3)', sprintf('%.2f',cfg.theta3), 'град'; ...
+ '  Интенсивность дождя', sprintf('%.0f',cfg.rain_mmh), 'мм/ч'; ...
+ '  Интерференц. запас', sprintf('%.0f',cfg.I_margin), 'дБ'; ...
+ '[ИЗМЕРЕНИЯ / ТОЧНОСТИ]','',''; ...
+ '  СКО RTT', sprintf('%.2f',cfg.sigma_RTT*1e6), 'мкс'; ...
+ '  Квант TA', sprintf('%.0f',cfg.TA_q*1e9), 'нс'; ...
+ '  СКО доплера', sprintf('%.0f',cfg.sigma_f), 'Гц'; ...
+ '  Дрейф опоры АТ', sprintf('%.1f',cfg.opp_ppm), 'ppm'; ...
+ '  СКО ГНСС', sprintf('%.1f',cfg.sigma_gnss), 'м'; ...
+ '  СКО эфемерид (поз.)', sprintf('%.0f',cfg.sigma_eph_pos), 'м'; ...
+ '  СКО эфемерид (скор.)', sprintf('%.2f',cfg.sigma_eph_vel), 'м/с'; ...
+ '  СКО угломера ГСО', sprintf('%.2f',cfg.sigma_ang), 'град'; ...
+ '[БЮДЖЕТЫ ТТ]','',''; ...
+ '  Допуск доплера', sprintf('±%.0f',cfg.dFmax/1e3), 'кГц'; ...
+ '  Допуск TA', sprintf('%.0f',cfg.taumax*1e9), 'нс'; ...
+ '  Бюджет наведения', sprintf('%.2f',cfg.pointMax), 'град'; ...
+ '[СЦЕНАРИЙ]','',''; ...
+ '  Горизонт T_end', sprintf('%.0f',cfg.T_end), 'с'; ...
+ '  Шаг моделирования dt', sprintf('%.0f',cfg.dt), 'с'; ...
+ '  Джамминг (нач./нараст./J-S)', sprintf('%.0f с / %.0f с / %.0f дБ',cfg.jam_t0,cfg.jam_ramp,cfg.jam_JS), '-'; ...
+ '  Офсет спуфинга', sprintf('%.0f',cfg.spoof_off/1e3), 'км'; ...
+ '  Время сканирования', sprintf('%.0f',cfg.scan_time), 'с'; ...
+ '  Время регистрации', sprintf('%.0f',cfg.reg_time), 'с'; ...
+ '  Факт. время моделирования', sprintf('%.0f',max(sim.t)), 'с'; ...
+ '  Обслуживающий КА (B1)', sprintf('№%d',sim.passB1.sat), '-'; ...
+ '  Пролёт B1 (t0..t1)', sprintf('%.0f..%.0f',sim.passB1.t0,sim.passB1.t1), 'с'; ...
+ '  КА спуфинг-контроля', sprintf('№%d',sim.passSp.sat), '-'; ...
+ '  Пролёт спуфинг-контроля', sprintf('%.0f..%.0f',sim.passSp.t0,sim.passSp.t1), 'с'; ...
+ '  Детекция джамминга', journal_num(sim.jamDet), 'с'; ...
+ '  Потеря ГНСС-фикса', journal_num(sim.fixLost), 'с'; ...
+ '  Детекция спуфинга', journal_num(sim.spoofDet), 'с'};
+jrn.params=table(string(rows(:,1)), string(rows(:,2)), string(rows(:,3)), ...
+    'VariableNames', {'Parameter','Value','Unit'});
+end
+
+% ============ ЖУРНАЛ: печать таблиц =====================================
+function print_journal(jrn,cfg)
+fprintf('\n');
+fprintf('##############################################################\n');
+fprintf('#        ЖУРНАЛ МОДЕЛИРОВАНИЯ (ТАБЛИЦЫ СОСТОЯНИЙ)            #\n');
+fprintf('##############################################################\n');
+% --- 1. Параметры ---
+P=jrn.params;
+fprintf('\n--- 1. ПАРАМЕТРЫ: СЦЕНА, ОРБИТЫ, КА, АТ, КАНАЛ, СЦЕНАРИЙ ---\n');
+fprintf('%-44s %20s  %s\n','Параметр','Значение','Ед.');
+fprintf('%s\n',repmat('-',1,78));
+for i=1:height(P)
+    if isempty(char(P.Value(i)))
+        fprintf('\n%s\n', char(P.Parameter(i)));
+    else
+        fprintf('%-44s %20s  %s\n', char(P.Parameter(i)), char(P.Value(i)), char(P.Unit(i)));
+    end
+end
+% --- 2. Пролёты ---
+Tp=jrn.passes;
+fprintf('\n--- 2. ПРОЛЁТЫ LEO НАД АТ (dur>=120 c): %d шт. ---\n', height(Tp));
+if height(Tp)>0
+    fprintf('%4s %8s %8s %8s %6s %9s %9s %8s  %s\n', ...
+        '№','t0,с','t1,с','длит,с','КА','RAAN,°','u0,°','max el,°','роль');
+    for i=1:height(Tp)
+        fprintf('%4d %8.0f %8.0f %8.0f %6d %9.1f %9.1f %8.1f  %s\n', ...
+            Tp.n(i), Tp.t0_s(i), Tp.t1_s(i), Tp.dur_s(i), Tp.satNo(i), ...
+            Tp.RAAN_deg(i), Tp.u0_deg(i), Tp.elmax_deg(i), char(Tp.role(i)));
+    end
+else
+    fprintf('(пролётов нет)\n');
+end
+% --- 3. B1-фиксы ---
+B=jrn.b1fix;
+fprintf('\n--- 3. B1-ФИКСЫ (RF-мост по одному КА): %d шт. ---\n', height(B));
+if height(B)>0
+    fprintf('%4s %8s %10s %10s %10s\n','№','t,с','шир,°','дол,°','ошибка,м');
+    for i=1:height(B)
+        fprintf('%4d %8.0f %10.4f %10.4f %10.1f\n', B.n(i), B.t_s(i), ...
+            B.lat_deg(i), B.lon_deg(i), B.err_m(i));
+    end
+else
+    fprintf('(B1-фиксов нет)\n');
+end
+% --- 4. События ---
+E=jrn.events;
+fprintf('\n--- 4. ЖУРНАЛ СОБЫТИЙ (автомат состояний P0..P7): %d шт. ---\n', height(E));
+if height(E)>0
+    fprintf('%4s %8s %8s %4s  %-14s  %s\n','№','t,с','t,мин','код','событие','сообщение');
+    for i=1:height(E)
+        fprintf('%4d %8.0f %8.1f %4d  %-14s  %s\n', i, E.t_s(i), E.t_min(i), ...
+            E.code(i), char(E.event(i)), char(E.message(i)));
+    end
+else
+    fprintf('(событий нет)\n');
+end
+% --- 5. Журнал состояний (выборка) ---
+S=jrn.state;
+if isfield(cfg,'journal_dt'), jd=cfg.journal_dt; else, jd=30; end
+if jd<1, jd=1; end
+ts=S.t_s;
+sel=[1; find(mod(ts,jd)==0); find([false; diff(S.P)~=0]); numel(ts)];
+for i=1:height(E)
+    j=find(ts>=E.t_s(i),1); if ~isempty(j), sel(end+1)=j; end %#ok<AGROW>
+end
+for i=1:height(Tp)
+    j=find(ts>=Tp.t0_s(i),1);   if ~isempty(j), sel(end+1)=j; end %#ok<AGROW>
+    j=find(ts>=Tp.t1_s(i)+1,1); if ~isempty(j), sel(end+1)=j; end %#ok<AGROW>
+end
+sel=unique(sel(sel>=1 & sel<=numel(ts)));
+fprintf('\n--- 5. ЖУРНАЛ СОСТОЯНИЙ: АТ / ГНСС / ПОМЕХА (%d строк: шаг %g с + события + смены P + границы пролётов) ---\n', ...
+    numel(sel), jd);
+fprintf('%7s %7s %3s %9s %9s %7s %5s %5s %7s %8s %10s %8s %10s %10s\n', ...
+    't,с','t,мин','P','шир,°','дол,°','V,м/с','Nl','Ng','J/S,дБ','C/N0гнс',...
+    'ошГНСС,м','спуф,км','мостRF,м','замроз,м');
+for ii=1:numel(sel)
+    i=sel(ii);
+    fprintf('%7.0f %7.1f %3.0f %9.4f %9.4f %7.1f %5.0f %5.0f %7.1f %8.1f %10.1f %8.1f %10.1f %10.1f\n', ...
+        S.t_s(i), S.t_s(i)/60, S.P(i), S.lat_deg(i), S.lon_deg(i), S.V_mps(i), ...
+        S.nvis_LEO(i), S.nvis_GEO(i), S.JS_dB(i), S.CN0_gnss_dBHz(i), ...
+        S.gnssErr_m(i), S.spoof_km(i), S.bridgeErr_m(i), S.freezeErr_m(i));
+end
+% --- 6. Журнал радиоканала ---
+jb=find(S.satNo>0 & mod(ts,10)==0);
+trn=find(S.satNo>0 & [false; diff(S.satNo)~=0]);
+jb=unique([jb; trn]);
+fprintf('\n--- 6. ЖУРНАЛ РАДИОКАНАЛА АТ<->LEO (во время пролётов, шаг 10 с): %d строк ---\n', numel(jb));
+fprintf('%7s %6s %7s %9s %8s %10s %10s %10s %9s %9s %7s\n', ...
+    't,с','КА№','el,°','даль,км','RTT,мс','fDист,кГц','fDизм,кГц','fDпрог,кГц',...
+    'dF,Гц','C/N0,дБГц','SNR,дБ');
+for ii=1:numel(jb)
+    i=jb(ii);
+    fprintf('%7.0f %6d %7.1f %9.1f %8.2f %10.2f %10.2f %10.2f %9.0f %9.1f %7.1f\n', ...
+        S.t_s(i), S.satNo(i), S.el_deg(i), S.range_km(i), S.RTT_ms(i), ...
+        S.fdT_kHz(i), S.fdM_kHz(i), S.fdP_kHz(i), S.Df_Hz(i), ...
+        S.CN0_dl_dBHz(i), S.SNR_dB(i));
+end
+% --- 7. Полная таблица и экспорт ---
+fprintf('\n--- 7. ПОЛНЫЙ ЖУРНАЛ ---\n');
+fprintf('Полный журнал состояний (каждые %g с, %d строк, 23 столбца): переменная jrn.state (table).\n', ...
+    cfg.dt, height(S));
+try
+    writetable(S,'journal_state_full.csv');
+    fprintf('Экспортирован файл journal_state_full.csv\n');
+catch
+    fprintf('Экспорт journal_state_full.csv пропущен (нет прав на запись в текущую папку).\n');
+end
+try
+    writetable(jrn.events,'journal_events.csv','Encoding','UTF-8');
+    fprintf('Экспортирован файл journal_events.csv\n');
+catch
+    fprintf('Экспорт journal_events.csv пропущен.\n');
+end
+fprintf('##############################################################\n');
+end
+
+function s=journal_num(x)
+if isnumeric(x) && ~isnan(x), s=sprintf('%.0f',x); else, s='не детектировано'; end
 end
